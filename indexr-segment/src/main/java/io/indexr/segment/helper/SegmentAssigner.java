@@ -2,7 +2,6 @@ package io.indexr.segment.helper;
 
 import com.google.common.base.Preconditions;
 
-import org.apache.directory.api.util.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -17,20 +16,22 @@ import io.indexr.segment.Segment;
 import io.indexr.segment.SegmentFd;
 import io.indexr.segment.SegmentPool;
 import io.indexr.segment.SystemConfig;
+import io.indexr.segment.cache.ExtIndexMemCache;
+import io.indexr.segment.cache.IndexMemCache;
+import io.indexr.segment.cache.PackMemCache;
 import io.indexr.segment.pack.DataPack;
-import io.indexr.segment.pack.IndexMemCache;
-import io.indexr.segment.pack.PackMemCache;
 import io.indexr.segment.rc.RCOperator;
 import io.indexr.segment.rt.RTSGroup;
 import io.indexr.segment.rt.RTSGroupInfo;
 import io.indexr.segment.rt.RealtimeSegment;
+import io.indexr.util.Strings;
 
 public class SegmentAssigner {
     private static final int packSplit = 8;
     private static final long chunkRowCount = DataPack.MAX_COUNT / packSplit;
     private static final Logger log = LoggerFactory.getLogger(SegmentAssigner.class);
 
-    // not columned < columned, bigger row count < less row count.
+    // not columned < columned, bigger row valueCount < less row valueCount.
     private static Comparator<Segment> segmentCmp = new Comparator<Segment>() {
         @Override
         public int compare(Segment s1, Segment s2) {
@@ -64,12 +65,13 @@ public class SegmentAssigner {
                                                                RCOperator rsFilter,
                                                                SegmentPool segmentPool,
                                                                IndexMemCache indexMemCache,
+                                                               ExtIndexMemCache extIndexMemCache,
                                                                PackMemCache packMemCache) throws Exception {
         log.debug("to assign assignCount:{}, works:{}, rsFilter:{}", assignCount, works, rsFilter);
 
         works = RangeWork.compact(works);
 
-        // approximate count.
+        // approximate valueCount.
         long totalRowCount = 0;
         long validRowCount = 0;
 
@@ -99,10 +101,10 @@ public class SegmentAssigner {
             }
 
             long segmentRowCount = fd.info().rowCount();
-            totalRowCount += segmentRowCount;
 
             if (fd instanceof RTSGroupInfo) {
                 Preconditions.checkState(work.startPackId() == -1);
+                totalRowCount += segmentRowCount;
 
                 RTSGroupInfo rtsgInfo = (RTSGroupInfo) fd;
                 RTSGroup rtsg = rtsgInfo.getRTSGroup();
@@ -114,7 +116,7 @@ public class SegmentAssigner {
                     }
                 }
                 for (RealtimeSegment rts : rtsg.realtimeSegments().values()) {
-                    try (Segment segment = rts.open(indexMemCache, packMemCache)) {
+                    try (Segment segment = rts.open(indexMemCache, extIndexMemCache, packMemCache)) {
                         if (rsFilter != null) {
                             rsFilter.materialize(segment.schema().getColumns());
                         }
@@ -136,7 +138,7 @@ public class SegmentAssigner {
                     }
                 }
             } else {
-                try (Segment segment = fd.open(indexMemCache, packMemCache)) {
+                try (Segment segment = fd.open(indexMemCache, extIndexMemCache, packMemCache)) {
                     Preconditions.checkState(segment.isColumned());
                     if (rsFilter != null) {
                         rsFilter.materialize(segment.schema().getColumns());
@@ -148,14 +150,18 @@ public class SegmentAssigner {
                         startPackId = 0;
                         endPackId = segment.packCount();
                     }
+
                     for (int packId = startPackId; packId < endPackId; packId++) {
-                        byte rsRes = RSValue.Some;
-                        if (rsFilter == null || (rsRes = rsFilter.roughCheckOnPack(segment, packId)) != RSValue.None) {
-                            validWorks.add(new SingleWork(segment.name(), packId));
-                            validRowCount += DataPack.packRowCount(segmentRowCount, packId);
-                        } else {
-                            log.debug("rs filter ignore segment {} pack {}", segment.name(), packId);
+                        int packRowCount = DataPack.packRowCount(segmentRowCount, packId);
+                        totalRowCount += packRowCount;
+
+                        if (rsFilter != null && rsFilter.roughCheckOnPack(segment, packId) == RSValue.None) {
+                            log.debug("rs index ignore segment {} pack {}", segment.name(), packId);
+                            continue;
                         }
+                        // Hit!
+                        validWorks.add(new SingleWork(segment.name(), packId));
+                        validRowCount += packRowCount;
                     }
                 }
             }

@@ -24,13 +24,15 @@ import java.util.Iterator;
 import java.util.List;
 
 import io.indexr.io.ByteBufferReader;
+import io.indexr.plugin.Plugins;
 import io.indexr.segment.ColumnSchema;
-import io.indexr.segment.ColumnType;
 import io.indexr.segment.Row;
 import io.indexr.segment.Segment;
 import io.indexr.segment.SegmentSchema;
-import io.indexr.segment.pack.Integrated;
-import io.indexr.segment.pack.IntegratedSegment;
+import io.indexr.segment.storage.itg.Integrate;
+import io.indexr.segment.storage.itg.IntegratedSegment;
+import io.indexr.segment.storage.itg.SegmentMeta;
+import io.indexr.server.rt.RealtimeConfig;
 import io.indexr.util.RuntimeUtil;
 
 public class CSVSegmentExporter {
@@ -101,25 +103,7 @@ public class CSVSegmentExporter {
                 for (int csvColId = 0; csvColId < valIndexes.length; csvColId++) {
                     int colId = valIndexes[csvColId];
                     ColumnSchema cs = columnSchemas[colId];
-                    switch (cs.dataType) {
-                        case ColumnType.INT:
-                            builder.append(row.getInt(colId));
-                            break;
-                        case ColumnType.LONG:
-                            builder.append(row.getLong(colId));
-                            break;
-                        case ColumnType.FLOAT:
-                            builder.append(row.getFloat(colId));
-                            break;
-                        case ColumnType.DOUBLE:
-                            builder.append(row.getDouble(colId));
-                            break;
-                        case ColumnType.STRING:
-                            builder.append(row.getString(colId).toString());
-                            break;
-                        default:
-                            throw new IllegalStateException("Unsupported column type: " + cs.dataType);
-                    }
+                    builder.append(row.getSQL(colId, cs.getSqlType()));
                     if (csvColId != valIndexes.length - 1) {
                         builder.append(spliter);
                     } else {
@@ -159,6 +143,7 @@ public class CSVSegmentExporter {
     }
 
     public static void main(String[] args) throws Exception {
+        RealtimeConfig.loadSubtypes();
         MyOptions options = new MyOptions();
         CmdLineParser parser = RuntimeUtil.parseArgs(args, options);
         if (options.help) {
@@ -171,20 +156,26 @@ public class CSVSegmentExporter {
         }
 
         URI uri = URI.create(options.segmentPath);
+        Plugins.loadPlugins();
         Configuration fsConfig = new Configuration();
         fsConfig.set("fs.hdfs.impl", DistributedFileSystem.class.getName());
         org.apache.hadoop.fs.FileSystem fileSystem = org.apache.hadoop.fs.FileSystem.get(uri, fsConfig);
 
         org.apache.hadoop.fs.Path segmentPath = new org.apache.hadoop.fs.Path(options.segmentPath);
         FileStatus fileStatus = fileSystem.getFileStatus(segmentPath);
-
+        if (fileStatus == null) {
+            System.out.printf("%s is not exists!\n", segmentPath);
+            System.exit(1);
+        }
+        int blockCount = fileSystem.getFileBlockLocations(fileStatus, 0, fileStatus.getLen()).length;
         ByteBufferReader.Opener readerOpener = ByteBufferReader.Opener.create(
                 fileSystem,
                 segmentPath,
-                fileStatus.getLen());
-        Integrated.SectionInfo sectionInfo = null;
+                fileStatus.getLen(),
+                blockCount);
+        SegmentMeta sectionInfo = null;
         try (ByteBufferReader reader = readerOpener.open(0)) {
-            sectionInfo = Integrated.read(reader);
+            sectionInfo = Integrate.INSTANCE.read(reader);
             if (sectionInfo == null) {
                 // Not a segment.
                 System.err.printf("[%s] is not a valid segment", options.segmentPath);

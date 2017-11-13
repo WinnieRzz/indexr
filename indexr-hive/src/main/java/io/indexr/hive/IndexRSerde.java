@@ -3,10 +3,8 @@ package io.indexr.hive;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.directory.api.util.Strings;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.ql.io.IOConstants;
-import org.apache.hadoop.hive.ql.io.parquet.serde.ArrayWritableObjectInspector;
 import org.apache.hadoop.hive.serde2.AbstractSerDe;
 import org.apache.hadoop.hive.serde2.SerDeException;
 import org.apache.hadoop.hive.serde2.SerDeStats;
@@ -15,11 +13,13 @@ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.StructField;
 import org.apache.hadoop.hive.serde2.objectinspector.StructObjectInspector;
+import org.apache.hadoop.hive.serde2.objectinspector.primitive.DateObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.DoubleObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.FloatObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.IntObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.LongObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.StringObjectInspector;
+import org.apache.hadoop.hive.serde2.objectinspector.primitive.TimestampObjectInspector;
 import org.apache.hadoop.hive.serde2.typeinfo.StructTypeInfo;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
@@ -37,6 +37,7 @@ import java.util.List;
 import java.util.Properties;
 
 import io.indexr.segment.ColumnSchema;
+import io.indexr.util.Strings;
 
 public class IndexRSerde extends AbstractSerDe {
     private static final Log LOG = LogFactory.getLog(IndexRSerde.class);
@@ -126,6 +127,10 @@ public class IndexRSerde extends AbstractSerDe {
                 return new LongWritable(((LongObjectInspector) inspector).get(obj));
             case STRING:
                 return new Text(((StringObjectInspector) inspector).getPrimitiveJavaObject(obj));
+            case DATE:
+                return ((DateObjectInspector) inspector).getPrimitiveWritableObject(obj);
+            case TIMESTAMP:
+                return ((TimestampObjectInspector) inspector).getPrimitiveWritableObject(obj);
             default:
                 throw new SerDeException("Can't serialize primitive : " + inspector.getPrimitiveCategory());
         }
@@ -176,7 +181,9 @@ public class IndexRSerde extends AbstractSerDe {
             int mapColId = -1;
             for (int colId = 0; colId < columnSchemas.length; colId++) {
                 ColumnSchema cs = columnSchemas[colId];
-                if (cs.getName().equalsIgnoreCase(name)) {
+                if (cs == null) {
+                    break;
+                } else if (cs.getName().equalsIgnoreCase(name)) {
                     mapColId = colId;
                     break;
                 }

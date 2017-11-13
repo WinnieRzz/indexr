@@ -2,7 +2,6 @@ package io.indexr.server;
 
 import org.apache.commons.io.IOUtils;
 import org.apache.curator.framework.CuratorFramework;
-import org.apache.directory.api.util.Strings;
 import org.apache.zookeeper.CreateMode;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.servlet.ServletContextHandler;
@@ -21,9 +20,11 @@ import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
-import io.indexr.segment.pack.PackDurationStat;
+import io.indexr.plugin.Plugins;
+import io.indexr.segment.PackDurationStat;
 import io.indexr.server.rt.RealtimeConfig;
 import io.indexr.util.GlobalExecSrv;
+import io.indexr.util.Strings;
 import io.indexr.util.Try;
 
 public class IndexRNode implements Closeable {
@@ -33,8 +34,10 @@ public class IndexRNode implements Closeable {
     private IndexRConfig config;
     private Server httpServer;
     private Future printStat;
+    private Future declareNode;
 
     public IndexRNode(String host) throws Exception {
+        Plugins.loadPlugins();
         RealtimeConfig.loadSubtypes();
         this.config = new IndexRConfig();
         CuratorFramework zkClient = config.getZkClient();
@@ -43,12 +46,20 @@ public class IndexRNode implements Closeable {
                 zkClient,
                 config.getFileSystem(),
                 config);
-        httpService();
+        if (config.getControlServerEnable()) {
+            httpService();
+        }
 
         String path = IndexRConfig.zkHostDeclarePath(host);
         ZkHelper.createIfNotExist(zkClient, path, CreateMode.EPHEMERAL);
 
-        printStat = GlobalExecSrv.EXECUTOR_SERVICE.scheduleAtFixedRate(PackDurationStat::print, 1, 1, TimeUnit.MINUTES);
+        printStat = GlobalExecSrv.EXECUTOR_SERVICE.scheduleAtFixedRate(
+                PackDurationStat::print,
+                1, 1, TimeUnit.MINUTES);
+        // Redeclare node to zk after a period of time.
+        declareNode = GlobalExecSrv.EXECUTOR_SERVICE.scheduleAtFixedRate(
+                () -> Try.on(() -> ZkHelper.createIfNotExist(zkClient, path, CreateMode.EPHEMERAL), 1, logger, "Failed to declare indexr node in ZK"),
+                0, 10, TimeUnit.MINUTES);
     }
 
     public IndexRNode() throws Exception {
@@ -84,6 +95,10 @@ public class IndexRNode implements Closeable {
         if (printStat != null) {
             printStat.cancel(true);
             printStat = null;
+        }
+        if (declareNode != null) {
+            declareNode.cancel(true);
+            declareNode = null;
         }
     }
 

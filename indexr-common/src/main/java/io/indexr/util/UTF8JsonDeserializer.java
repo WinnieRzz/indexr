@@ -34,18 +34,28 @@ public class UTF8JsonDeserializer {
     private static final byte STATE_VALUE_FINISH = 6;
     private static final byte STATE_FINISH = 7;
 
-    // NOTE: Those should keep in sync with io.indexr.segment.ColumnType
-    public static final byte INVALID = -1;
-    public static final byte INT = 1;
-    public static final byte LONG = 2;
-    public static final byte FLOAT = 3;
-    public static final byte DOUBLE = 4;
-    public static final byte STRING = 5;
+    // NOTE: Those should keep in sync with io.indexr.segment.SQLType
+    public static final int INVALID = -1;
+    public static final int INT = 1;
+    public static final int BIGINT = 2;
+    public static final int FLOAT = 3;
+    public static final int DOUBLE = 4;
+    public static final int VARCHAR = 5;
+    public static final int DATE = 6;
+    public static final int TIME = 7;
+    public static final int DATETIME = 8;
+
+    private final boolean numberEmptyAsZero;
 
     private ByteBuffer valueBuffer;
 
-    public UTF8JsonDeserializer() {
+    public UTF8JsonDeserializer(boolean numberEmptyAsZero) {
+        this.numberEmptyAsZero = numberEmptyAsZero;
         this.valueBuffer = ByteBuffer.allocate(1 << 16);
+    }
+
+    public UTF8JsonDeserializer() {
+        this(false);
     }
 
     public boolean parse(byte[] data, Listener listener) {
@@ -56,7 +66,7 @@ public class UTF8JsonDeserializer {
         byte state = STATE_BEGIN;
         boolean escape = false;
         boolean couldBeString = false;
-        byte valueType = 0;
+        int valueType = 0;
         valueBuffer.clear();
         int objectOffset = 0;
 
@@ -298,53 +308,65 @@ public class UTF8JsonDeserializer {
         return (firstByte >= '0' && firstByte <= '9') || firstByte == '+' || firstByte == '-' || firstByte == '.';
     }
 
-    private static boolean onNumber(byte type, ByteBuffer buffer, Listener listener) {
+    private boolean onNumber(int type, ByteBuffer buffer, Listener listener) {
         try {
+            boolean isEmpty = buffer.remaining() == 0;
+            if (isEmpty) {
+                if (!numberEmptyAsZero) {
+                    return false;
+                }
+                switch (type) {
+                    case INT:
+                        return listener.onIntValue(0);
+                    case BIGINT:
+                        return listener.onLongValue(0);
+                    case FLOAT:
+                        return listener.onFloatValue(0);
+                    case DOUBLE:
+                        return listener.onDoubleValue(0);
+                    case DATE:
+                        return listener.onLongValue(0);
+                    case TIME:
+                        return listener.onIntValue(0);
+                    case DATETIME:
+                        return listener.onLongValue(0);
+                    default:
+                        throw new IllegalStateException("illegal type " + type);
+                }
+            }
             if (!basicNumberCheck(buffer)) {
                 return false;
             }
             switch (type) {
                 case INT:
                     return listener.onIntValue((int) UTF8Util.parseLong(buffer.array(), buffer.position(), buffer.remaining()));
-                case LONG:
+                case BIGINT:
                     return listener.onLongValue(UTF8Util.parseLong(buffer.array(), buffer.position(), buffer.remaining()));
                 case FLOAT:
                     return listener.onFloatValue(UTF8Util.parseFloat(buffer.array(), buffer.position(), buffer.remaining()));
                 case DOUBLE:
                     return listener.onDoubleValue(UTF8Util.parseDouble(buffer.array(), buffer.position(), buffer.remaining()));
+                case DATE:
+                    return listener.onLongValue(DateTimeUtil.parseDate(buffer.array(), buffer.position(), buffer.remaining()));
+                case TIME:
+                    return listener.onIntValue(DateTimeUtil.parseTime(buffer.array(), buffer.position(), buffer.remaining()));
+                case DATETIME:
+                    return listener.onLongValue(DateTimeUtil.parseDateTime(buffer.array(), buffer.position(), buffer.remaining()));
                 default:
                     throw new IllegalStateException("illegal type " + type);
             }
         } catch (NumberFormatException e) {
             // HACK!!!
             return false;
-            //try {
-            //    switch (type) {
-            //        case INT: {
-            //            double v = UTF8Util.parseDouble(buffer.array(), buffer.position(), buffer.remaining());
-            //            return listener.onIntValue((int) v);
-            //        }
-            //        case LONG: {
-            //            double v = UTF8Util.parseDouble(buffer.array(), buffer.position(), buffer.remaining());
-            //            return listener.onLongValue((long) v);
-            //        }
-            //        default:
-            //            throw new IllegalStateException("illegal type " + type);
-            //    }
-            //} catch (NumberFormatException e2) {
-            //    return false;
-            //}
         }
     }
 
     private static void logErrorJson(String format, byte[] data, int offset, int len, int pos) {
         try {
-            if (logger.isTraceEnabled()) {
-                logger.trace("{}, json: {}, error pos: {}",
-                        format,
-                        new String(data, offset, len, UTF8Util.UTF8_NAME),
-                        new String(data, pos, (offset + len) - pos, UTF8Util.UTF8_NAME));
-            }
+            logger.warn("{}, json: {}, error pos: {}",
+                    format,
+                    new String(data, offset, len, UTF8Util.UTF8_NAME),
+                    new String(data, pos, (offset + len) - pos, UTF8Util.UTF8_NAME));
         } catch (UnsupportedEncodingException e) {
             // Should not happen.
         }
@@ -360,7 +382,7 @@ public class UTF8JsonDeserializer {
          * Found a key, return the value type.
          * Return <code>-1</code> means you don't care this key-value pair, which will not cause onXXValue fired.
          */
-        byte onKey(ByteBuffer key, int size);
+        int onKey(ByteBuffer key, int size);
 
         /**
          * Found a string value, corresponding to last key.
@@ -376,7 +398,7 @@ public class UTF8JsonDeserializer {
         boolean onDoubleValue(double value);
     }
 
-    private static boolean isNumber(byte type) {
-        return type == INT || type == LONG || type == FLOAT || type == DOUBLE;
+    private static boolean isNumber(int type) {
+        return type != VARCHAR;
     }
 }

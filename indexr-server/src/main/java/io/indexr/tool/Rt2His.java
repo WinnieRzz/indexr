@@ -1,6 +1,5 @@
 package io.indexr.tool;
 
-import org.apache.directory.api.util.Strings;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
@@ -11,8 +10,11 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 
+import io.indexr.plugin.Plugins;
+import io.indexr.server.rt.RealtimeConfig;
 import io.indexr.server.rt2his.Rt2HisOnHive;
 import io.indexr.util.RuntimeUtil;
+import io.indexr.util.Strings;
 
 public class Rt2His {
     private static final Logger logger = LoggerFactory.getLogger(Rt2His.class);
@@ -70,7 +72,7 @@ public class Rt2His {
             return false;
         }
         if (Strings.isEmpty(options.hiveConnection)) {
-            System.out.println("please specify hive connection by -hive");
+            System.out.println("please specify hive connection by -hivecnn");
             return false;
         }
         if (Strings.isEmpty(options.table)) {
@@ -78,7 +80,7 @@ public class Rt2His {
             return false;
         }
         if (Strings.isEmpty(options.partitionColumn)) {
-            System.out.println("please specify segment partition column by -column");
+            System.out.println("please specify segment partition column by -segpc");
             return false;
         }
         Rt2HisOnHive rt2HisOnHive = new Rt2HisOnHive(
@@ -93,7 +95,8 @@ public class Rt2His {
         return rt2HisOnHive.handle();
     }
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
+        RealtimeConfig.loadSubtypes();
         MyOptions options = new MyOptions();
         CmdLineParser parser = RuntimeUtil.parseArgs(args, options);
         if (options.help) {
@@ -101,6 +104,7 @@ public class Rt2His {
             return;
         }
 
+        Plugins.loadPlugins();
         if (!hiveMode(options)) {
             logger.info("Failed. options: {}", options.toString());
             System.exit(1);

@@ -8,19 +8,24 @@ RELEASE_PATH=${ROOT_DIR}/distribution/indexr-${VERSION}
 
 cd ${ROOT_DIR}
 
-sh ${ROOT_DIR}/script/compile_indexr-hive.sh
+bash ${ROOT_DIR}/script/compile_indexr-hive.sh
 
 # copy hive files
 rm -rf ${RELEASE_PATH}/indexr-hive/aux
 mkdir -p ${RELEASE_PATH}/indexr-hive/aux
 
 function cp_jar {
+    if [ ! -f $1 ]; then
+        echo "$1 not exists!"
+        exit 1
+    fi
     cp -f $1 ${RELEASE_PATH}/indexr-hive/aux/
 }
 
-cp_jar ${ROOT_DIR}/indexr-common/target/indexr-common-${VERSION}.jar
-cp_jar ${ROOT_DIR}/indexr-segment/target/indexr-segment-${VERSION}.jar
-cp_jar ${ROOT_DIR}/indexr-hive/target/indexr-hive-${VERSION}.jar
+cp_jar ${MAVEN_PATH}/io/indexr/indexr-common/${VERSION}/indexr-common-${VERSION}.jar
+cp_jar ${MAVEN_PATH}/io/indexr/indexr-segment/${VERSION}/indexr-segment-${VERSION}.jar
+cp_jar ${MAVEN_PATH}/io/indexr/indexr-vlt-segment/${VERSION}/indexr-vlt-segment-${VERSION}.jar
+cp_jar ${MAVEN_PATH}/io/indexr/indexr-hive/${VERSION}/indexr-hive-${VERSION}.jar
 
 # copy depenencies
 
@@ -33,3 +38,4 @@ cp_jar ${MAVEN_PATH}/com/fasterxml/jackson/core/jackson-annotations/2.6.0/jackso
 cp_jar ${MAVEN_PATH}/net/java/dev/jna/jna/4.2.1/jna-4.2.1.jar
 cp_jar ${MAVEN_PATH}/org/jodd/jodd-core/3.6.7/jodd-core-3.6.7.jar
 
+cp_jar ${MAVEN_PATH}/it/unimi/dsi/fastutil/6.5.9/fastutil-6.5.9.jar

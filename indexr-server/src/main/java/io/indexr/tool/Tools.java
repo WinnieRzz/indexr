@@ -4,7 +4,6 @@ import com.google.common.base.Preconditions;
 
 import org.apache.commons.io.IOUtils;
 import org.apache.curator.framework.CuratorFramework;
-import org.apache.directory.api.util.Strings;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -31,13 +30,17 @@ import java.util.List;
 import java.util.Set;
 
 import io.indexr.io.ByteBufferReader;
+import io.indexr.plugin.Plugins;
+import io.indexr.segment.Column;
 import io.indexr.segment.InfoSegment;
 import io.indexr.segment.SegmentManager;
+import io.indexr.segment.SegmentMode;
 import io.indexr.segment.SegmentSchema;
-import io.indexr.segment.pack.Integrated;
-import io.indexr.segment.pack.IntegratedSegment;
+import io.indexr.segment.pack.DataPackNode;
 import io.indexr.segment.rt.RTSGroupInfo;
-import io.indexr.segment.rt.RealtimeHelper;
+import io.indexr.segment.storage.StorageSegment;
+import io.indexr.segment.storage.itg.IntegratedColumn;
+import io.indexr.segment.storage.itg.IntegratedSegment;
 import io.indexr.server.FileSegmentManager;
 import io.indexr.server.IndexRConfig;
 import io.indexr.server.SegmentHelper;
@@ -47,8 +50,10 @@ import io.indexr.server.ZkTableManager;
 import io.indexr.server.rt.RealtimeConfig;
 import io.indexr.server.rt.RealtimeSegmentPool;
 import io.indexr.server.rt2his.HiveHelper;
+import io.indexr.util.GenericCompression;
 import io.indexr.util.JsonUtil;
 import io.indexr.util.RuntimeUtil;
+import io.indexr.util.Strings;
 import io.indexr.util.Try;
 
 public class Tools {
@@ -68,9 +73,9 @@ public class Tools {
                 "\nrmtb      - remove table. [-t]" +
                 "\ndctb      - describe table. [-t] " +
                 "\nlisths    - list all historical segments. [-t]" +
-                "\nlistrs    - list all realtime segments. [-t]" +
+                "\nlistrs    - list all realtime segments. [-t, -v]" +
                 "\nrmseg     - remove segments. [-t, -s]" +
-                "\ndchs      - describ historical segments. [-t, -s]" +
+                "\ndchs      - describ historical segments. [-t, -s, -v]" +
                 "\nstoprt    - stop realtime. [-host, -port]" +
                 "\nstartrt   - start realtime. [-host, -port]" +
                 "\nstopnode  - stop indexr node. [-host, -port]" +
@@ -80,17 +85,21 @@ public class Tools {
                 "\naddrtt    - add realtime table to hosts. [-t, -host]" +
                 "\nrmrtt     - remove realtime table from hosts. [-t, -host]" +
                 "\nnotifysu  - notify segment update. [-t]" +
-                "\nhivesql   - get the hive table creation sql. Specify the partition column of hive table by -column <columnName>. [-t, -c, -column, -hivetable]" +
+                "\nhivesql   - get the hive table creation sql. Specify the partition column of hive table by -column <columnName>. [-t, -c, -column, -hivetb]" +
+                "\nupmode    - update table segment mode. [-t, -mode]" +
+                "\nmergefrag - merge fragments of table. [-t]" +
                 "\n=====================================")
         String cmd;
 
+        @Option(name = "-v", usage = "verbose or not")
+        boolean verbose = false;
         @Option(name = "-t", metaVar = "<tableName>", usage = "table name(s), splited by `,`")
         String table;
         @Option(name = "-s", metaVar = "<segmentName>", usage = "segment name(s), splited by `,`")
         String segment;
         @Option(name = "-c", metaVar = "<schemaPath>", usage = "the path of table schema")
         String schemapath;
-        @Option(name = "-col", metaVar = "<columnName>", usage = "the column name")
+        @Option(name = "-col", metaVar = "<columnName>", usage = "the column name, splited by `,`")
         String columnName;
         @Option(name = "-hivetb", metaVar = "<hiveTableName>", usage = "the hive table name")
         String hiveTable;
@@ -99,9 +108,14 @@ public class Tools {
         String host;
         @Option(name = "-port", metaVar = "<port>", usage = "control port of node")
         int port = 9235;
+
+        @Option(name = "-mode", metaVar = "<mode>", usage = "segment mode")
+        String mode = SegmentMode.DEFAULT.name();
     }
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
+        // Hack, make jvm init the static fields.
+        RealtimeConfig.loadSubtypes();
         MyOptions options = new MyOptions();
         CmdLineParser parser = RuntimeUtil.parseArgs(args, options);
         if (options.help) {
@@ -109,6 +123,7 @@ public class Tools {
             return;
         }
 
+        Plugins.loadPlugins();
         IndexRConfig config = new IndexRConfig();
         boolean ok = false;
         try {
@@ -167,6 +182,10 @@ public class Tools {
                 return notifySegmentUpdate(options, config);
             case "hivesql":
                 return hiveCreateSql(options, config);
+            case "upmode":
+                return updateMode(options, config);
+            case "mergefrag":
+                return mergeFragments(options, config);
             default:
                 System.out.println("Illegal cmd: " + options.cmd);
                 return false;
@@ -187,18 +206,18 @@ public class Tools {
 
     private static boolean setTable(MyOptions options, IndexRConfig config) throws Exception {
         Preconditions.checkState(!Strings.isEmpty(options.table), "Please specify table name! -t <name>");
-        Preconditions.checkState(!Strings.isEmpty(options.schemapath), "Please specify scheam path! -c <path>");
+        Preconditions.checkState(!Strings.isEmpty(options.schemapath), "Please specify schema path! -c <path>");
         String[] tableNames = options.table.split(",");
         Preconditions.checkState(tableNames.length == 1, "Can only add one table one time!");
         TableSchema schema = JsonUtil.loadConfig(Paths.get(options.schemapath), TableSchema.class);
-        RealtimeConfig rtConfig = schema.realtimeConfig;
-        if (rtConfig != null) {
-            String error = RealtimeHelper.validateSetting(schema.schema.getColumns(), rtConfig.dims, rtConfig.metrics, rtConfig.grouping);
-            if (error != null) {
-                System.out.println(error);
-                return false;
-            }
-        }
+        //RealtimeConfig rtConfig = schema.realtimeConfig;
+        //if (rtConfig != null) {
+        //    String error = RealtimeHelper.validateSetting(schema.schema.getColumns(), rtConfig.dims, rtConfig.metrics, rtConfig.grouping);
+        //    if (error != null) {
+        //        System.out.println(error);
+        //        return false;
+        //    }
+        //}
         ZkTableManager tm = new ZkTableManager(config.getZkClient());
         tm.set(options.table, schema);
         System.out.println("OK");
@@ -231,7 +250,12 @@ public class Tools {
         Preconditions.checkState(!Strings.isEmpty(options.table), "Please specify table name! -t <name>");
         String[] tableNames = options.table.split(",");
         Preconditions.checkState(tableNames.length == 1, "Only one table name are supported!");
-        SegmentManager tm = new FileSegmentManager(options.table, config.getFileSystem(), config.getDataRoot());
+        ZkTableManager zkTableManager = new ZkTableManager(config.getZkClient());
+        TableSchema schema = zkTableManager.getTableSchema(options.table);
+        SegmentManager tm = new FileSegmentManager(
+                options.table,
+                config.getFileSystem(),
+                IndexRConfig.segmentRootPath(config.getDataRoot(), options.table, schema.location));
         List<String> names = tm.allSegmentNames();
         if (names == null) {
             return true;
@@ -252,19 +276,25 @@ public class Tools {
             if (bytes == null) {
                 continue;
             }
-            RealtimeSegmentPool.HostSegmentInfo hostInfo = JsonUtil.fromJson(bytes, RealtimeSegmentPool.HostSegmentInfo.class);
+            RealtimeSegmentPool.HostSegmentInfo hostInfo = JsonUtil.fromJson(GenericCompression.decomress(bytes), RealtimeSegmentPool.HostSegmentInfo.class);
             if (hostInfo == null) {
                 continue;
             }
-            List<String> rtsegs = new ArrayList<>();
-            for (RTSGroupInfo info : hostInfo.rtsGroupInfos) {
-                rtsegs.add(info.name());
-            }
+            List<RTSGroupInfo> rtsegs = new ArrayList<>(hostInfo.rtsGroupInfos);
             if (!rtsegs.isEmpty()) {
-                System.out.printf("host [%s]:\n", host);
-                rtsegs.sort(String::compareTo);
-                rtsegs.forEach(System.out::println);
-                System.out.println();
+                rtsegs.sort((a, b) -> a.name().compareTo(b.name()));
+                for (RTSGroupInfo info : rtsegs) {
+                    System.out.println(info.name() + ":\n----------");
+                    System.out.println("host: " + host);
+                    System.out.println("rowCount: " + info.rowCount());
+                    System.out.println("version: " + info.version());
+                    System.out.println("mode: " + info.mode());
+                    if (options.verbose) {
+                        System.out.println("schema:\n" + JsonUtil.toJson(info.schema()));
+                        System.out.println("columnNodes:\n" + JsonUtil.toJson(info.columnNodes));
+                    }
+                    System.out.println();
+                }
             }
         }
         return true;
@@ -274,34 +304,62 @@ public class Tools {
         Preconditions.checkState(!Strings.isEmpty(options.table), "Please specify table name! -t <name>");
         Preconditions.checkState(!Strings.isEmpty(options.segment), "Please specify segment name! -s <name>");
 
+        ZkTableManager zkTableManager = new ZkTableManager(config.getZkClient());
+        TableSchema tableSchema = zkTableManager.getTableSchema(options.table);
+        Path segmentRootPath = IndexRConfig.segmentRootPath(config.getDataRoot(), options.table, tableSchema.location);
+
         String[] segNames = options.segment.split(",");
         for (String segName : segNames) {
             segName = segName.trim();
-            Path path = config.segmentPath(options.table, segName);
+            Path path = new Path(segmentRootPath, segName);
             FileSystem fileSystem = config.getFileSystem();
             FileStatus fileStatus = fileSystem.getFileStatus(path);
+
             if (fileStatus == null) {
                 System.out.printf("%s is not exists!\n", segName);
                 continue;
             }
+            int blockCount = fileSystem.getFileBlockLocations(fileStatus, 0, fileStatus.getLen()).length;
             ByteBufferReader.Opener readerOpener = ByteBufferReader.Opener.create(
                     fileSystem,
                     path,
-                    fileStatus.getLen());
-            try (ByteBufferReader reader = readerOpener.open(0)) {
-                Integrated.SectionInfo sectionInfo = Integrated.read(reader);
-                if (sectionInfo == null) {
-                    System.out.printf("%s is not a legal segment!\n", segName);
-                    continue;
-                }
-                IntegratedSegment.Fd fd = IntegratedSegment.Fd.create(segName, sectionInfo, readerOpener);
+                    fileStatus.getLen(),
+                    blockCount);
+            IntegratedSegment.Fd fd = IntegratedSegment.Fd.create(segName, readerOpener);
+            if (fd == null) {
+                System.out.printf("%s is not a legal segment!\n", segName);
+                continue;
+            }
+            try (StorageSegment segment = fd.open()) {
                 InfoSegment infoSegment = fd.info();
                 SegmentSchema schema = infoSegment.schema();
                 long rowCount = infoSegment.rowCount();
                 System.out.println(segName + ":\n----------");
                 System.out.println("rowCount: " + rowCount);
-                System.out.println("schema:\n" + JsonUtil.toJson(schema));
-                System.out.println("sectionInfo:\n" + JsonUtil.toJson(fd.sectionInfo()));
+                System.out.println("size: " + fileStatus.getLen());
+                System.out.println("version: " + segment.version());
+                System.out.println("mode: " + segment.mode());
+                if (options.verbose) {
+                    System.out.println("schema:\n" + JsonUtil.toJson(schema));
+                    System.out.println("sectionInfo:\n" + JsonUtil.toJson(fd.sectionInfo()));
+                    System.out.println("columnInfo:");
+                    for (int colId = 0; colId < schema.getColumns().size(); colId++) {
+                        Column column = segment.column(colId);
+                        long dpnSize = 0;
+                        long indexSize = 0;
+                        long extIndexSize = 0;
+                        long outerIndexSize = ((IntegratedColumn) column).outerIndexSize();
+                        long dataSize = 0;
+                        for (int packId = 0; packId < column.packCount(); packId++) {
+                            DataPackNode dpn = column.dpn(packId);
+                            dpnSize += segment.mode().versionAdapter.dpnSize(segment.version(), segment.mode());
+                            indexSize += dpn.indexSize();
+                            extIndexSize += dpn.extIndexSize();
+                            dataSize += dpn.packSize();
+                        }
+                        System.out.printf("  %s: dpn: %s, index: %s, extIndex: %s, outerIndex: %s, data: %s, dict(0th): %s\n", column.name(), dpnSize, indexSize, extIndexSize, outerIndexSize, dataSize, column.dpn(0).isDictEncoded());
+                    }
+                }
                 System.out.println();
             }
         }
@@ -314,7 +372,12 @@ public class Tools {
         Preconditions.checkState(tableNames.length == 1, "Only one table name are supported!");
         Preconditions.checkState(options.segment != null, "Please specify segment name! -s <name>");
 
-        SegmentManager tm = new FileSegmentManager(options.table, config.getFileSystem(), config.getDataRoot());
+        ZkTableManager zkTableManager = new ZkTableManager(config.getZkClient());
+        TableSchema schema = zkTableManager.getTableSchema(options.table);
+        SegmentManager tm = new FileSegmentManager(
+                options.table,
+                config.getFileSystem(),
+                IndexRConfig.segmentRootPath(config.getDataRoot(), options.table, schema.location));
         String[] names = options.segment.split(",");
         for (String name : names) {
             tm.remove(name.trim());
@@ -454,7 +517,10 @@ public class Tools {
 
         ZkTableManager tm = new ZkTableManager(config.getZkClient());
         Preconditions.checkState(tm.getTableSchema(options.table) != null, "Table [%s] not exists!", options.table);
-        SegmentHelper.notifyUpdate(config.getFileSystem(), config.getDataRoot(), options.table);
+        TableSchema schema = tm.getTableSchema(options.table);
+        SegmentHelper.notifyUpdate(
+                config.getFileSystem(),
+                IndexRConfig.segmentRootPath(config.getDataRoot(), options.table, schema.location));
         System.out.println("OK");
 
         return true;
@@ -479,7 +545,9 @@ public class Tools {
                 Strings.isEmpty(options.hiveTable) ? options.table : options.hiveTable,
                 true,
                 schema.schema,
-                IndexRConfig.segmentRootPath(config.getDataRoot(), options.table),
+                schema.mode,
+                schema.aggSchema,
+                IndexRConfig.segmentRootPath(config.getDataRoot(), options.table, schema.location).toString(),
                 options.columnName
         );
         if (!createSql.trim().endsWith(";")) {
@@ -489,4 +557,34 @@ public class Tools {
         return true;
     }
 
+    private static boolean updateMode(MyOptions options, IndexRConfig config) throws Exception {
+        Preconditions.checkState(!Strings.isEmpty(options.table), "Please specify table name! -t <name>");
+        Preconditions.checkState(!Strings.isEmpty(options.mode), "Please specify segment mode by -mode <mode>");
+        SegmentMode newMode = SegmentMode.fromName(options.mode);
+
+        String[] tables = options.table.trim().split(",");
+        for (String table : tables) {
+            table = table.trim();
+            ZkTableManager tm = new ZkTableManager(config.getZkClient());
+            TableSchema schema = tm.getTableSchema(table);
+            if (schema == null) {
+                System.out.printf("Table [%s] schema not found in system.\n", table);
+                return false;
+            }
+
+            schema.setMode(newMode);
+            schema.realtimeConfig.setMode(newMode);
+
+            tm.set(table, schema);
+        }
+
+        return true;
+    }
+
+    private static boolean mergeFragments(MyOptions options, IndexRConfig config) throws Exception {
+        Preconditions.checkState(!Strings.isEmpty(options.table), "Please specify table name! -t <name>");
+
+        FragmentMerger.mergeTable(options.table, config);
+        return true;
+    }
 }

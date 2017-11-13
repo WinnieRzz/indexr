@@ -5,20 +5,20 @@ import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
 import org.apache.commons.lang.StringUtils;
-import org.apache.directory.api.util.Strings;
+
+import java.io.Serializable;
 
 import io.indexr.util.JsonUtil;
 
-public class ColumnSchema {
+public class ColumnSchema implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     @JsonIgnore
     public final String name;
-    /** @see {@link ColumnType} */
     @JsonIgnore
-    public final byte dataType;
+    public final SQLType sqlType;
     @JsonIgnore
-    public final String dataTypeName;
-
-    // Those fields below only used by realtime ingestion.
+    public final boolean isIndexed;
     @JsonIgnore
     public final long defaultNumberValue;
     @JsonIgnore
@@ -26,31 +26,32 @@ public class ColumnSchema {
 
     @JsonCreator
     public ColumnSchema(@JsonProperty("name") String name,
-                        @JsonProperty("dataType") String dataTypeName,
+                        @JsonProperty("dataType") String sqlTypeName,
+                        @JsonProperty("index") Boolean isIndexed,
                         @JsonProperty("default") String defaultValue) {
-        this(name, ColumnType.fromName(dataTypeName), defaultValue);
+        this(name, SQLType.fromName(sqlTypeName), isIndexed != null ? isIndexed : false, defaultValue);
+    }
+
+    public ColumnSchema(String name, SQLType sqlType) {
+        this(name, sqlType, false);
     }
 
     public ColumnSchema(String name,
-                        byte dataType) {
-        this(name, dataType, "");
+                        SQLType sqlType,
+                        boolean isIndexed) {
+        this(name, sqlType, isIndexed, "");
     }
 
     public ColumnSchema(String name,
-                        byte dataType,
+                        SQLType sqlType,
+                        boolean isIndexed,
                         String defaultValue) {
-        this.name = name;
-        this.dataTypeName = ColumnType.toName(dataType);
-        this.dataType = dataType;
-        this.defaultStringValue = defaultValue == null ? "" : defaultValue;
-        if (ColumnType.isNumber(dataType)) {
-            this.defaultNumberValue = Strings.isEmpty(defaultStringValue)
-                    ? 0 : ColumnType.castStringToNumber(defaultStringValue, dataType);
-        } else {
-            this.defaultNumberValue = 0;
-        }
+        this.name = name.intern();
+        this.sqlType = sqlType;
+        this.isIndexed = isIndexed;
+        this.defaultStringValue = defaultValue == null ? "" : defaultValue.intern();
+        this.defaultNumberValue = sqlType.isNumber() ? SQLType.parseNumber(sqlType, defaultValue) : 0;
     }
-
 
     @JsonProperty("name")
     public String getName() {
@@ -59,12 +60,17 @@ public class ColumnSchema {
 
     @JsonIgnore
     public byte getDataType() {
-        return dataType;
+        return sqlType.dataType;
+    }
+
+    @JsonIgnore
+    public SQLType getSqlType() {
+        return sqlType;
     }
 
     @JsonProperty("dataType")
-    public String getDataTypeName() {
-        return dataTypeName;
+    public String getSQLTypeName() {
+        return sqlType.name();
     }
 
     @JsonProperty("default")
@@ -75,6 +81,11 @@ public class ColumnSchema {
     @JsonIgnore
     public long getDefaultNumberValue() {
         return defaultNumberValue;
+    }
+
+    @JsonProperty("index")
+    public boolean isIndexed() {
+        return isIndexed;
     }
 
     @Override
@@ -92,6 +103,10 @@ public class ColumnSchema {
         }
         ColumnSchema otherCS = (ColumnSchema) other;
         return StringUtils.equals(name, otherCS.name)
-                && dataType == otherCS.dataType;
+                && sqlType == otherCS.sqlType;
+    }
+
+    public ColumnSchema withName(String name) {
+        return new ColumnSchema(name, this.sqlType, this.isIndexed, this.defaultStringValue);
     }
 }

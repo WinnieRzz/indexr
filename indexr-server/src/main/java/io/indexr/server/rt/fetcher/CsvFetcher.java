@@ -2,7 +2,6 @@ package io.indexr.server.rt.fetcher;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 
-import org.apache.directory.api.util.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -13,11 +12,12 @@ import java.io.InputStreamReader;
 import java.util.Arrays;
 import java.util.List;
 
-import io.indexr.segment.ColumnType;
+import io.indexr.segment.SQLType;
 import io.indexr.segment.SegmentSchema;
 import io.indexr.segment.rt.Fetcher;
 import io.indexr.segment.rt.UTF8JsonRowCreator;
 import io.indexr.segment.rt.UTF8Row;
+import io.indexr.util.Strings;
 import io.indexr.util.Trick;
 import io.indexr.util.Try;
 
@@ -32,7 +32,7 @@ public class CsvFetcher implements Fetcher {
     @JsonProperty("spliter")
     public final String spliter;
 
-    private byte[] colTypes;
+    private SQLType[] colTypes;
     private BufferedReader reader;
     private String line;
 
@@ -58,18 +58,18 @@ public class CsvFetcher implements Fetcher {
         }
         if (header == null) {
             header = new String[schema.columns.size()];
-            colTypes = new byte[header.length];
+            colTypes = new SQLType[header.length];
             for (int colId = 0; colId < header.length; colId++) {
                 header[colId] = schema.columns.get(colId).getName();
-                colTypes[colId] = schema.columns.get(colId).getDataType();
+                colTypes[colId] = schema.columns.get(colId).getSqlType();
             }
         } else {
-            colTypes = new byte[header.length];
+            colTypes = new SQLType[header.length];
             for (int colId = 0; colId < colTypes.length; colId++) {
                 String name = header[colId];
                 int index = Trick.indexWhere(schema.columns, cs -> cs.getName().equals(name));
                 if (index >= 0) {
-                    colTypes[colId] = schema.columns.get(index).dataType;
+                    colTypes[colId] = schema.columns.get(index).getSqlType();
                 }
             }
         }
@@ -97,7 +97,10 @@ public class CsvFetcher implements Fetcher {
         for (int colId = 0; colId < header.length; colId++) {
             sb.append('\"').append(header[colId]).append("\": ");
             String v = values[colId];
-            if (colTypes[colId] == ColumnType.STRING) {
+            if (colTypes[colId] == SQLType.VARCHAR
+                    || colTypes[colId] == SQLType.DATE
+                    || colTypes[colId] == SQLType.TIME
+                    || colTypes[colId] == SQLType.DATETIME) {
                 sb.append('\"').append(v).append('\"');
             } else {
                 if (Strings.isEmpty(v)) {

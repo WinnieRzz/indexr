@@ -7,17 +7,18 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import org.apache.spark.unsafe.types.UTF8String;
 
 import java.io.IOException;
-import java.util.BitSet;
 import java.util.Collection;
 import java.util.Collections;
 
 import io.indexr.segment.Column;
 import io.indexr.segment.ColumnType;
 import io.indexr.segment.InfoSegment;
+import io.indexr.segment.OuterIndex;
+import io.indexr.segment.PackExtIndex;
 import io.indexr.segment.RSValue;
 import io.indexr.segment.Segment;
-import io.indexr.segment.pack.ColumnNode;
-import io.indexr.segment.pack.DataPack;
+import io.indexr.segment.storage.ColumnNode;
+import io.indexr.util.BitMap;
 
 public class Between implements CmpOperator {
     @JsonProperty("attr")
@@ -74,6 +75,16 @@ public class Between implements CmpOperator {
     }
 
     @Override
+    public BitMap exactCheckOnPack(Segment segment) throws IOException {
+        assert attr.checkCurrent(segment.schema().columns);
+
+        Column column = segment.column(attr.columnId());
+        try (OuterIndex outerIndex = column.outerIndex()) {
+            return outerIndex.between(column, numValue1, numValue2, strValue1, strValue2, false);
+        }
+    }
+
+    @Override
     public byte roughCheckOnPack(Segment segment, int packId) throws IOException {
         assert attr.checkCurrent(segment.schema().columns);
 
@@ -93,7 +104,7 @@ public class Between implements CmpOperator {
 
         int colId = attr.columnId();
         ColumnNode columnNode = segment.columnNode(colId);
-        byte type = attr.columType();
+        byte type = attr.dataType();
         if (ColumnType.isNumber(type)) {
             return RoughCheck_N.betweenCheckOnColumn(columnNode, type, numValue1, numValue2);
         } else {
@@ -102,114 +113,10 @@ public class Between implements CmpOperator {
     }
 
     @Override
-    public byte roughCheckOnRow(DataPack[] rowPacks) {
-        DataPack pack = rowPacks[attr.columnId()];
-        byte type = attr.columType();
-        int rowCount = pack.objCount();
-        int hitCount = 0;
-        switch (type) {
-            case ColumnType.INT: {
-                int min = (int) numValue1;
-                int max = (int) numValue2;
-                for (int rowId = 0; rowId < rowCount; rowId++) {
-                    int v = pack.intValueAt(rowId);
-                    if (v >= min && v <= max) {
-                        hitCount++;
-                    }
-                }
-                break;
-            }
-            case ColumnType.LONG: {
-                long min = numValue1;
-                long max = numValue2;
-                for (int rowId = 0; rowId < rowCount; rowId++) {
-                    long v = pack.longValueAt(rowId);
-                    if (v >= min && v <= max) {
-                        hitCount++;
-                    }
-                }
-                break;
-            }
-            case ColumnType.FLOAT: {
-                float min = (float) numValue1;
-                float max = (float) numValue2;
-                for (int rowId = 0; rowId < rowCount; rowId++) {
-                    float v = pack.floatValueAt(rowId);
-                    if (v >= min && v <= max) {
-                        hitCount++;
-                    }
-                }
-                break;
-            }
-            case ColumnType.DOUBLE: {
-                double min = (double) numValue1;
-                double max = (double) numValue2;
-                for (int rowId = 0; rowId < rowCount; rowId++) {
-                    double v = pack.doubleValueAt(rowId);
-                    if (v >= min && v <= max) {
-                        hitCount++;
-                    }
-                }
-                break;
-            }
-            default:
-                throw new IllegalStateException("column type " + attr.columType() + " is illegal in " + getType().toUpperCase());
-        }
-        if (hitCount == rowCount) {
-            return RSValue.All;
-        } else if (hitCount > 0) {
-            return RSValue.Some;
-        } else {
-            return RSValue.None;
-        }
-    }
-
-    @Override
-    public BitSet exactCheckOnRow(DataPack[] rowPacks) {
-        DataPack pack = rowPacks[attr.columnId()];
-        int rowCount = pack.objCount();
-        BitSet colRes = new BitSet(pack.objCount());
-        switch (attr.columType()) {
-            case ColumnType.INT: {
-                int min = (int) numValue1;
-                int max = (int) numValue2;
-                for (int rowId = 0; rowId < rowCount; rowId++) {
-                    int v = pack.intValueAt(rowId);
-                    colRes.set(rowId, v >= min && v <= max);
-                }
-                break;
-            }
-            case ColumnType.LONG: {
-                long min = numValue1;
-                long max = numValue2;
-                for (int rowId = 0; rowId < rowCount; rowId++) {
-                    long v = pack.longValueAt(rowId);
-                    colRes.set(rowId, v >= min && v <= max);
-                }
-                break;
-            }
-            case ColumnType.FLOAT: {
-                float min = (float) numValue1;
-                float max = (float) numValue2;
-                for (int rowId = 0; rowId < rowCount; rowId++) {
-                    float v = pack.floatValueAt(rowId);
-                    colRes.set(rowId, v >= min && v <= max);
-                }
-                break;
-            }
-            case ColumnType.DOUBLE: {
-                double min = (double) numValue1;
-                double max = (double) numValue2;
-                for (int rowId = 0; rowId < rowCount; rowId++) {
-                    double v = pack.doubleValueAt(rowId);
-                    colRes.set(rowId, v >= min && v <= max);
-                }
-                break;
-            }
-            default:
-                throw new IllegalStateException("column type " + attr.columType() + " is illegal in " + getType().toUpperCase());
-        }
-        return colRes;
+    public BitMap exactCheckOnRow(Segment segment, int packId) throws IOException {
+        Column column = segment.column(attr.columnId());
+        PackExtIndex extIndex = column.extIndex(packId);
+        return extIndex.between(column, packId, numValue1, numValue2, strValue1, strValue2);
     }
 
     @Override
@@ -217,7 +124,7 @@ public class Between implements CmpOperator {
         if (strValue1 == null && strValue2 == null) {
             return String.format("%s($%s: %s, %s)", this.getClass().getSimpleName(), attr, numValue1, numValue2);
         } else {
-            return String.format("%s($%s: %s, %s)", this.getClass().getSimpleName(), attr, strValue2, strValue2);
+            return String.format("%s($%s: %s, %s)", this.getClass().getSimpleName(), attr, strValue1, strValue2);
         }
     }
 }

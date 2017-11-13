@@ -2,6 +2,7 @@ package io.indexr.segment;
 
 import org.apache.spark.unsafe.types.UTF8String;
 
+import io.indexr.data.ByteArraySetter;
 import io.indexr.data.BytePiece;
 import io.indexr.data.BytePieceSetter;
 import io.indexr.data.DoubleSetter;
@@ -14,7 +15,7 @@ import io.indexr.data.LongSetter;
  */
 public interface DPValues {
 
-    int count();
+    int valueCount();
 
     default long uniformValAt(int index, byte type) {
         switch (type) {
@@ -104,6 +105,14 @@ public interface DPValues {
         for (int index = start; index < end; index++) {
             rawValueAt(index, bytes);
             setter.set(index, bytes);
+        }
+    }
+
+    default void foreach(int start, int count, ByteArraySetter setter) {
+        int end = start + count;
+        for (int index = start; index < end; index++) {
+            byte[] bytes = rawValueAt(index);
+            setter.set(index, bytes, 0, bytes.length);
         }
     }
 }

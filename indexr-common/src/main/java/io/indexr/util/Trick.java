@@ -18,6 +18,13 @@ import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 
 public class Trick {
+
+    public static int[] subArray(int[] arr, int from, int to) {
+        int[] sub = new int[to - from];
+        System.arraycopy(arr, from, sub, 0, to - from);
+        return sub;
+    }
+
     public static <T> T on(T t, Consumer<T> op) {
         op.accept(t);
         return t;
@@ -255,11 +262,37 @@ public class Trick {
         return -1;
     }
 
+    public static boolean isEmpty(Collection<?> c) {
+        return c == null || c.isEmpty();
+    }
+
+    public static <R> List<R> split(String str, String p, F<String, R> f) {
+        if (Strings.isEmpty(str)) {
+            return Collections.emptyList();
+        }
+        List<R> list = new ArrayList<R>();
+        String[] ss = str.trim().split(p);
+        for (String s : ss) {
+            R r = f.f(s);
+            if (r != null) {
+                list.add(r);
+            }
+        }
+        return list;
+    }
+
     public static interface F<A, B> {
         B f(A a);
     }
 
     public static boolean equals(Object a, Object b) {
         return a == null ? b == null : (b != null) && a.equals(b);
+    }
+
+    public static boolean hasOne(boolean[] arr) {
+        for (boolean v : arr) {
+            if (v) return true;
+        }
+        return false;
     }
 }

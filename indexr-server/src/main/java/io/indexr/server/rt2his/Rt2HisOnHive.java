@@ -22,18 +22,26 @@ import java.sql.Statement;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import io.indexr.segment.ColumnSchema;
-import io.indexr.segment.ColumnType;
+import io.indexr.segment.SQLType;
+import io.indexr.segment.SegmentMode;
 import io.indexr.segment.SegmentSchema;
+import io.indexr.segment.rt.AggSchema;
+import io.indexr.segment.rt.Metric;
+import io.indexr.segment.rt.RealtimeHelper;
 import io.indexr.server.SegmentHelper;
 import io.indexr.util.IOUtil;
+import io.indexr.util.JsonUtil;
+import io.indexr.util.Trick;
 import io.indexr.util.Try;
 
 /**
@@ -98,9 +106,37 @@ public class Rt2HisOnHive {
             tableLocation = getHiveTableLocation(createTable);
             String tablePartitionColumn = getHiveTablePartitionColumn(createTable);
             SegmentSchema schema = getSchema(createTable);
+            Map<String, String> properties = getTableProperties(createTable);
+            SegmentMode mode = SegmentMode.fromName(properties.get(HiveHelper.KEY_SEGMENT_MODE));
+
+            String sortColumnsStr = properties.getOrDefault(HiveHelper.KEY_SORT_COLUMNS, "");
+            String aggGroupingStr = properties.getOrDefault(HiveHelper.KEY_AGG_GROUPING, "false");
+            String aggDimsStr = properties.getOrDefault(HiveHelper.KEY_AGG_DIMS, "");
+            String aggMetricsStr = properties.getOrDefault(HiveHelper.KEY_AGG_METRICS, "");
+
+            boolean grouping = Boolean.parseBoolean(aggGroupingStr.trim());
+            List<String> sortColumns = Trick.split(sortColumnsStr, ",", String::trim);
+            List<String> dims = Trick.split(aggDimsStr, ",", String::trim);
+            if (dims.isEmpty()) {
+                dims = sortColumns;
+            }
+            List<Metric> metrics = Trick.split(aggMetricsStr, ",", s -> {
+                String[] ss = s.trim().split(":", 2);
+                return new Metric(ss[0].trim(), ss[1].trim());
+            });
+            AggSchema aggSchema = new AggSchema(
+                    grouping,
+                    dims,
+                    metrics);
+            String error = RealtimeHelper.validateSetting(schema.columns, dims, metrics, grouping);
+            Preconditions.checkState(error == null, error);
+
             logger.debug("tableLocation: {}", tableLocation);
             logger.debug("tablePartitionColumn: {}", tablePartitionColumn);
             logger.debug("schema: {}", schema);
+            logger.debug("mode: {}", mode);
+            logger.debug("aggSchema: {}", aggSchema);
+            logger.debug("properties: {}", JsonUtil.toJson(properties));
 
             rtTableName = String.format(
                     "indexr_rt2his_rt_%s_%s_%s",
@@ -113,7 +149,7 @@ public class Rt2HisOnHive {
                     time,
                     RandomStringUtils.randomAlphabetic(16));
 
-            return move(connection, schema, tableLocation, tablePartitionColumn, rtTableName, segTmpTableName);
+            return move(connection, schema, mode, aggSchema, tableLocation, tablePartitionColumn, rtTableName, segTmpTableName);
         } catch (Exception e) {
             logger.error("", e);
             return false;
@@ -150,6 +186,8 @@ public class Rt2HisOnHive {
 
     private boolean move(Connection connection,
                          SegmentSchema schema,
+                         SegmentMode mode,
+                         AggSchema aggSchema,
                          String tableLocation,
                          String tablePartitionColumn,
                          String rtTableName,
@@ -171,8 +209,8 @@ public class Rt2HisOnHive {
         }
 
         String rt2hisPath = tableLocation + "/rt2his";
-        createTable(connection, rtTableName, true, schema, rt2hisPath, null);
-        createTable(connection, segTmpTableName, false, schema, null, tablePartitionColumn);
+        createTable(connection, rtTableName, true, schema, mode, aggSchema, rt2hisPath, null);
+        createTable(connection, segTmpTableName, false, schema, mode, aggSchema, null, tablePartitionColumn);
         String segTmpTableLocation = getHiveTableLocation(getHiveTableCreateSql(connection, segTmpTableName));
 
         // Move segments in /rt into /rt2his folder.
@@ -246,7 +284,7 @@ public class Rt2HisOnHive {
                 }
 
                 // Add partitions manually.
-                String addPartition = String.format("ALTER TABLE %s ADD IF NOT EXISTS PARTITION (%s=%s)",
+                String addPartition = String.format("ALTER TABLE %s ADD IF NOT EXISTS PARTITION (%s='%s')",
                         hiveTable, tablePartitionColumn, partition);
                 try (Statement myStatement = connection.createStatement()) {
                     myStatement.execute(addPartition);
@@ -299,6 +337,24 @@ public class Rt2HisOnHive {
         }
     }
 
+    private static Map<String, String> getTableProperties(String createSql) {
+        String propertiesSql = fetchByRegx(createSql, "TBLPROPERTIES\\s?\\([^)]+\\)");
+        String colDef = StringUtils.removeStart(propertiesSql, "TBLPROPERTIES").trim();
+        colDef = StringUtils.removeStart(colDef, "(");
+        colDef = StringUtils.removeEnd(colDef, ")").trim();
+        Map<String, String> m = new HashMap<>();
+        for (String s : colDef.split("\n")) {
+            String[] k_v = StringUtils.removeEnd(s.trim(), ",").split("'='", 2);
+            if (k_v.length != 2) {
+                continue;
+            }
+            String key = StringUtils.removeStart(k_v[0], "'");
+            String value = StringUtils.removeEnd(k_v[1], "'");
+            m.put(key, value);
+        }
+        return m;
+    }
+
     private static String getHiveTableLocation(String createSql) {
         String locationSql = fetchByRegx(createSql, "LOCATION\\s+'.+'");
         return StringUtils.strip(StringUtils.removeStart(locationSql, "LOCATION").trim(), "'");
@@ -307,8 +363,8 @@ public class Rt2HisOnHive {
     private static String getHiveTablePartitionColumn(String createSql) {
         String partitionSql = fetchByRegx(createSql, "PARTITIONED BY\\s?\\([^)]+\\)");
         String colDef = StringUtils.removeStart(partitionSql, "PARTITIONED BY").trim();
-        colDef = StringUtils.stripStart(colDef, "(");
-        colDef = StringUtils.stripEnd(colDef, ")");
+        colDef = StringUtils.removeStart(colDef, "(");
+        colDef = StringUtils.removeEnd(colDef, ")");
         if (colDef.split(",").length > 1) {
             throw new IllegalStateException(String.format("%s contains more than one partition column", createSql));
         }
@@ -327,27 +383,28 @@ public class Rt2HisOnHive {
             String[] strs = colStr.trim().split(" ", 2);
             String colName = StringUtils.strip(strs[0], "`");
             String colType = strs[1].trim();
-            byte indexrType;
-            switch (colType) {
-                case "int":
+            SQLType indexrType;
+            switch (colType.toUpperCase()) {
                 case "INT":
-                    indexrType = ColumnType.INT;
+                    indexrType = SQLType.INT;
                     break;
-                case "bigint":
                 case "BIGINT":
-                    indexrType = ColumnType.LONG;
+                    indexrType = SQLType.BIGINT;
                     break;
-                case "float":
                 case "FLOAT":
-                    indexrType = ColumnType.FLOAT;
+                    indexrType = SQLType.FLOAT;
                     break;
-                case "double":
                 case "DOUBLE":
-                    indexrType = ColumnType.DOUBLE;
+                    indexrType = SQLType.DOUBLE;
                     break;
-                case "string":
                 case "STRING":
-                    indexrType = ColumnType.STRING;
+                    indexrType = SQLType.VARCHAR;
+                    break;
+                case "DATE":
+                    indexrType = SQLType.DATE;
+                    break;
+                case "TIMESTAMP":
+                    indexrType = SQLType.DATETIME;
                     break;
                 default:
                     throw new IllegalStateException("unsupported hive type " + colType);
@@ -370,10 +427,19 @@ public class Rt2HisOnHive {
                                     String tableName,
                                     boolean external,
                                     SegmentSchema schema,
+                                    SegmentMode mode,
+                                    AggSchema aggSchema,
                                     String location,
                                     String partitionColumn) throws Exception {
         try (Statement statement = connection.createStatement()) {
-            String createTableSql = HiveHelper.getHiveTableCreateSql(tableName, external, schema, location, partitionColumn);
+            String createTableSql = HiveHelper.getHiveTableCreateSql(
+                    tableName,
+                    external,
+                    schema,
+                    mode,
+                    aggSchema,
+                    location,
+                    partitionColumn);
             logger.debug("create table:\n{}", createTableSql);
             statement.execute(createTableSql);
         }

@@ -1,12 +1,12 @@
 package io.indexr.segment.rc;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonSetter;
 import com.fasterxml.jackson.annotation.JsonSubTypes;
 import com.fasterxml.jackson.annotation.JsonTypeInfo;
 
 import java.io.IOException;
-import java.util.BitSet;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -15,13 +15,13 @@ import java.util.function.Consumer;
 import io.indexr.segment.ColumnSchema;
 import io.indexr.segment.InfoSegment;
 import io.indexr.segment.Segment;
-import io.indexr.segment.pack.DataPack;
+import io.indexr.util.BitMap;
 
 /**
  * A rough set filter operator.
- * <p/>
+ *
  * User must call {@link #materialize(List)} before calling {@link #roughCheckOnColumn(InfoSegment)},
- * {@link #roughCheckOnPack(Segment)}, {@link #roughCheckOnPack(Segment, int)} and {@link #exactCheckOnRow(DataPack[])}.
+ * {@link #roughCheckOnPack(Segment)}, {@link #roughCheckOnPack(Segment, int)} and {@link #exactCheckOnRow(Segment, int)}.
  * e.g.
  * <pre>
  *     rsFilter.optimize();
@@ -56,8 +56,13 @@ public interface RCOperator {
     /**
      * The {@link Attr}s of this op. Return empty if no attr.
      */
+    @JsonIgnore
     Collection<Attr> attr();
 
+    @JsonIgnore
+    default boolean isAccurate() {return true;}
+
+    @JsonIgnore
     default List<RCOperator> children() {
         return Collections.emptyList();
     }
@@ -68,6 +73,7 @@ public interface RCOperator {
         assert type.equals(getType());
     }
 
+    @JsonIgnore
     default byte[] roughCheckOnPack(Segment segment) throws IOException {
         int packCount = segment.packCount();
         byte[] rsValues = new byte[packCount];
@@ -77,38 +83,38 @@ public interface RCOperator {
         return rsValues;
     }
 
+    BitMap exactCheckOnPack(Segment segment) throws IOException;
+
     byte roughCheckOnColumn(InfoSegment segment) throws IOException;
 
     byte roughCheckOnPack(Segment segment, int packId) throws IOException;
 
-    byte roughCheckOnRow(DataPack[] rowPacks);
+    BitMap exactCheckOnRow(Segment segment, int packId) throws IOException;
 
-    BitSet exactCheckOnRow(DataPack[] rowPacks);
-
-    /**
+    /*
      * Apply not to this node.
-     * <p/>
+     * 
      * e.g. "not (a >= b)" -> "a < b"
      */
     RCOperator applyNot();
 
-    /**
+    /*
      * Switch operator direction between operands.
-     * <p/>
+     * 
      * e.g. "a >= b" -> "a <= b"
      */
     default RCOperator switchDirection() {return this;}
 
-    /**
+    /*
      * Optimize current node.
-     * <p/>
+     * 
      * e.g. "a = 1 or a = 2 or a = 3" -> "a in (1, 2, 3)"
      */
     default RCOperator doOptimize() {return this;}
 
     /**
      * Optimize the whole tree. Call this method on root node after constructed a rc operator tree.
-     * <p/>
+     *
      * Generally child classes should not override this method.
      */
     default RCOperator optimize() {

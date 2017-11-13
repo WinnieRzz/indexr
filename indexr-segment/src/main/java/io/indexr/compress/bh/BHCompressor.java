@@ -2,19 +2,28 @@ package io.indexr.compress.bh;
 
 import com.sun.jna.NativeLibrary;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import io.indexr.io.ByteSlice;
 import io.indexr.util.MemoryUtil;
 
 /**
  * Wrapper of brighthouse compression.
- * This class is closely linked to c++ code & native data structure, don't touch it unless you know what you are doing.
- * <p/>
+ * This class is closely linked to cpp code and native data structure, don't touch it unless you know what you are doing.
+ *
  * Note that all values here are in unsigned form, including max_val.
  */
 public class BHCompressor {
+    private static final Logger logger = LoggerFactory.getLogger(BHCompressor.class);
+
     static {
         NativeLibrary.addSearchPath("bhcompress", "lib");
         NativeLibrary.addSearchPath("bhcompress", "/usr/local/lib");
+    }
+
+    private static void logError(Throwable t) {
+        logger.error("Call compress method failed. Make sure you have setup native compression lib correctly.", t);
     }
 
     @FunctionalInterface
@@ -39,7 +48,7 @@ public class BHCompressor {
             throw new RuntimeException(String.format("compress number err[%d]", err));
         }
         int cmp_data_size = MemoryUtil.getInt(native_p + 9);
-        return ByteSlice.fromAddress(native_p, 1 + 8 + 4 + cmp_data_size);
+        return ByteSlice.fromAddress(native_p, 1 + 8 + 4 + cmp_data_size, true);
     }
 
     private static ByteSlice decompressNumber(ByteSlice cmpData, int itemSize, int byteSizeShift, long maxVal, NumberDecompressor decompressor) {
@@ -53,43 +62,92 @@ public class BHCompressor {
         if (native_p == 0) {
             throw new RuntimeException("decompress number err, check the std output for error code");
         }
-        return ByteSlice.fromAddress(native_p, itemSize << byteSizeShift);
+        return ByteSlice.fromAddress(native_p, itemSize << byteSizeShift, true);
     }
 
     public static ByteSlice compressByte(ByteSlice data, int itemSize, long maxVal) {
-        return compressNumber(data, itemSize, 0, maxVal, BhcompressLibrary.INSTANCE::JavaCompress_Number_Byte_NP);
+        try {
+            return compressNumber(data, itemSize, 0, maxVal, BhcompressLibrary.INSTANCE::JavaCompress_Number_Byte_NP);
+        } catch (Throwable t) {
+            logError(t);
+            throw t;
+        }
     }
 
     public static ByteSlice compressShort(ByteSlice data, int itemSize, long maxVal) {
-        return compressNumber(data, itemSize, 1, maxVal, BhcompressLibrary.INSTANCE::JavaCompress_Number_Short_NP);
+        try {
+            return compressNumber(data, itemSize, 1, maxVal, BhcompressLibrary.INSTANCE::JavaCompress_Number_Short_NP);
+        } catch (Throwable t) {
+            logError(t);
+            throw t;
+        }
     }
 
     public static ByteSlice compressInt(ByteSlice data, int itemSize, long maxVal) {
-        return compressNumber(data, itemSize, 2, maxVal, BhcompressLibrary.INSTANCE::JavaCompress_Number_Int_NP);
+        try {
+            return compressNumber(data, itemSize, 2, maxVal, BhcompressLibrary.INSTANCE::JavaCompress_Number_Int_NP);
+        } catch (Throwable t) {
+            logError(t);
+            throw t;
+        }
     }
 
     public static ByteSlice compressLong(ByteSlice data, int itemSize, long maxVal) {
-        return compressNumber(data, itemSize, 3, maxVal, BhcompressLibrary.INSTANCE::JavaCompress_Number_Long_NP);
+        try {
+            return compressNumber(data, itemSize, 3, maxVal, BhcompressLibrary.INSTANCE::JavaCompress_Number_Long_NP);
+        } catch (Throwable t) {
+            logError(t);
+            throw t;
+        }
     }
 
     public static ByteSlice decompressByte(ByteSlice cmpData, int itemSize, long maxVal) {
-        return decompressNumber(cmpData, itemSize, 0, maxVal, BhcompressLibrary.INSTANCE::JavaDecompress_Number_Byte_NP);
+        try {
+            return decompressNumber(cmpData, itemSize, 0, maxVal, BhcompressLibrary.INSTANCE::JavaDecompress_Number_Byte_NP);
+        } catch (Throwable t) {
+            logError(t);
+            throw t;
+        }
     }
 
     public static ByteSlice decompressShort(ByteSlice cmpData, int itemSize, long maxVal) {
-        return decompressNumber(cmpData, itemSize, 1, maxVal, BhcompressLibrary.INSTANCE::JavaDecompress_Number_Short_NP);
+        try {
+            return decompressNumber(cmpData, itemSize, 1, maxVal, BhcompressLibrary.INSTANCE::JavaDecompress_Number_Short_NP);
+        } catch (Throwable t) {
+            logError(t);
+            throw t;
+        }
     }
 
     public static ByteSlice decompressInt(ByteSlice cmpData, int itemSize, long maxVal) {
-        return decompressNumber(cmpData, itemSize, 2, maxVal, BhcompressLibrary.INSTANCE::JavaDecompress_Number_Int_NP);
+        try {
+            return decompressNumber(cmpData, itemSize, 2, maxVal, BhcompressLibrary.INSTANCE::JavaDecompress_Number_Int_NP);
+        } catch (Throwable t) {
+            logError(t);
+            throw t;
+        }
     }
 
     public static ByteSlice decompressLong(ByteSlice cmpData, int itemSize, long maxVal) {
-        return decompressNumber(cmpData, itemSize, 3, maxVal, BhcompressLibrary.INSTANCE::JavaDecompress_Number_Long_NP);
+        try {
+            return decompressNumber(cmpData, itemSize, 3, maxVal, BhcompressLibrary.INSTANCE::JavaDecompress_Number_Long_NP);
+        } catch (Throwable t) {
+            logError(t);
+            throw t;
+        }
     }
 
     public static ByteSlice compressIndexedStr(ByteSlice data, int itemSize) {
-        if (itemSize == 0) {
+        try {
+            return doCompressIndexedStr(data, itemSize);
+        } catch (Throwable t) {
+            logError(t);
+            throw t;
+        }
+    }
+
+    private static ByteSlice doCompressIndexedStr(ByteSlice data, int itemSize) {
+        if (itemSize == 0 || data.getInt(0) == 0) {
             return ByteSlice.empty();
         }
         long native_p = BhcompressLibrary.INSTANCE.JavaCompress_IndexedString_NP(data.address(), itemSize);
@@ -100,14 +158,23 @@ public class BHCompressor {
         }
         int max_len = MemoryUtil.getShort(native_p + 1) & 0xFFFF;
         if (max_len == 0) {
-            return ByteSlice.fromAddress(native_p, 1 + 2);
+            return ByteSlice.fromAddress(native_p, 1 + 2, true);
         }
         int index_cmp_data_size = MemoryUtil.getInt(native_p + 3);
         int str_cmp_data_size = MemoryUtil.getInt(native_p + 7);
-        return ByteSlice.fromAddress(native_p, 1 + 2 + 4 + 4 + index_cmp_data_size + str_cmp_data_size);
+        return ByteSlice.fromAddress(native_p, 1 + 2 + 4 + 4 + index_cmp_data_size + str_cmp_data_size, true);
     }
 
     public static ByteSlice decompressIndexedStr(ByteSlice cmpData, int itemSize) {
+        try {
+            return doDecompressIndexedStr(cmpData, itemSize);
+        } catch (Throwable t) {
+            logError(t);
+            throw t;
+        }
+    }
+
+    private static ByteSlice doDecompressIndexedStr(ByteSlice cmpData, int itemSize) {
         if (itemSize == 0) {
             return ByteSlice.empty();
         }
@@ -116,11 +183,19 @@ public class BHCompressor {
             throw new RuntimeException("decompress string err, check the std output for error code");
         }
         int str_total_len = MemoryUtil.getInt(native_p);
-        return ByteSlice.fromAddress(native_p, 4 + (itemSize << 3) + str_total_len);
+        return ByteSlice.fromAddress(native_p, 4 + (itemSize << 3) + str_total_len, true);
     }
 
-
     public static ByteSlice compressIndexedStr_v1(ByteSlice data, int itemSize) {
+        try {
+            return doCompressIndexedStr_v1(data, itemSize);
+        } catch (Throwable t) {
+            logError(t);
+            throw t;
+        }
+    }
+
+    private static ByteSlice doCompressIndexedStr_v1(ByteSlice data, int itemSize) {
         if (itemSize == 0) {
             return ByteSlice.empty();
         }
@@ -135,10 +210,19 @@ public class BHCompressor {
         }
         int index_cmp_data_size = MemoryUtil.getInt(native_p + 1);
         int str_cmp_data_size = MemoryUtil.getInt(native_p + 5);
-        return ByteSlice.fromAddress(native_p, 1 + 4 + 4 + index_cmp_data_size + str_cmp_data_size);
+        return ByteSlice.fromAddress(native_p, 1 + 4 + 4 + index_cmp_data_size + str_cmp_data_size, true);
     }
 
     public static ByteSlice decompressIndexedStr_v1(ByteSlice cmpData, int itemSize) {
+        try {
+            return doDecompressIndexedStr_v1(cmpData, itemSize);
+        } catch (Throwable t) {
+            logError(t);
+            throw t;
+        }
+    }
+
+    private static ByteSlice doDecompressIndexedStr_v1(ByteSlice cmpData, int itemSize) {
         if (itemSize == 0) {
             return ByteSlice.empty();
         }
@@ -153,7 +237,7 @@ public class BHCompressor {
             throw new RuntimeException("decompress string err, check the std output for error code");
         }
         int str_total_len = MemoryUtil.getInt(native_p + (itemSize << 2));
-        return ByteSlice.fromAddress(native_p, ((itemSize + 1) << 2) + str_total_len);
+        return ByteSlice.fromAddress(native_p, ((itemSize + 1) << 2) + str_total_len, true);
     }
 
     /**

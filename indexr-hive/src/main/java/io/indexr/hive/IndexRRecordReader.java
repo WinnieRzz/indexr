@@ -4,17 +4,18 @@ import com.google.common.base.Preconditions;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.directory.api.util.Strings;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.serde2.ColumnProjectionUtils;
+import org.apache.hadoop.hive.serde2.io.DateWritable;
 import org.apache.hadoop.hive.serde2.io.DoubleWritable;
-import org.apache.hadoop.io.BytesWritable;
+import org.apache.hadoop.hive.serde2.io.TimestampWritable;
 import org.apache.hadoop.io.FloatWritable;
 import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.io.IntWritable;
 import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.Text;
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.mapred.FileSplit;
 import org.apache.hadoop.mapred.InputSplit;
@@ -26,10 +27,11 @@ import java.util.List;
 
 import io.indexr.io.ByteBufferReader;
 import io.indexr.segment.ColumnSchema;
-import io.indexr.segment.ColumnType;
 import io.indexr.segment.Row;
 import io.indexr.segment.Segment;
-import io.indexr.segment.pack.IntegratedSegment;
+import io.indexr.segment.storage.itg.IntegratedSegment;
+import io.indexr.util.DateTimeUtil;
+import io.indexr.util.Strings;
 import io.indexr.util.Trick;
 
 public class IndexRRecordReader implements RecordReader<Void, SchemaWritable> {
@@ -84,9 +86,14 @@ public class IndexRRecordReader implements RecordReader<Void, SchemaWritable> {
             for (int i = 0; i < ss.length; i++) {
                 String col = ss[i];
                 int colId = Trick.indexFirst(segColSchemas, c -> c.getName().equalsIgnoreCase(col));
-                Preconditions.checkState(colId >= 0, String.format("Column [%s] not found in segment [%s]", col, segment.name()));
-                projectCols[i] = segColSchemas.get(colId);
-                projectColIds[i] = colId;
+                //Preconditions.checkState(colId >= 0, String.format("Column [%s] not found in segment [%s]", col, segment.name()));
+                if (colId < 0) {
+                    projectCols[i] = null;
+                    projectColIds[i] = -1;
+                } else {
+                    projectCols[i] = segColSchemas.get(colId);
+                    projectColIds[i] = colId;
+                }
             }
         }
     }
@@ -105,24 +112,35 @@ public class IndexRRecordReader implements RecordReader<Void, SchemaWritable> {
         for (int i = 0; i < projectCols.length; i++) {
             ColumnSchema columnSchema = projectCols[i];
             int colId = projectColIds[i];
-            switch (columnSchema.dataType) {
-                case ColumnType.INT:
+            if (colId == -1 || columnSchema == null) {
+                writables[i] = null;
+                continue;
+            }
+            switch (columnSchema.getSqlType()) {
+                case INT:
                     writables[i] = new IntWritable(current.getInt(colId));
                     break;
-                case ColumnType.LONG:
+                case BIGINT:
                     writables[i] = new LongWritable(current.getLong(colId));
                     break;
-                case ColumnType.FLOAT:
+                case FLOAT:
                     writables[i] = new FloatWritable(current.getFloat(colId));
                     break;
-                case ColumnType.DOUBLE:
+                case DOUBLE:
                     writables[i] = new DoubleWritable(current.getDouble(colId));
                     break;
-                case ColumnType.STRING:
-                    writables[i] = new BytesWritable(current.getString(colId).getBytes());
+                case VARCHAR:
+                    writables[i] = new Text(current.getString(colId).getBytes());
+                    //writables[i] =  new BytesWritable();
+                    break;
+                case DATE:
+                    writables[i] = new DateWritable(DateTimeUtil.getJavaSQLDate(current.getLong(colId)));
+                    break;
+                case DATETIME:
+                    writables[i] = new TimestampWritable(DateTimeUtil.getJavaSQLTimeStamp(current.getLong(colId)));
                     break;
                 default:
-                    throw new IllegalStateException("column type " + columnSchema.dataType + " is illegal");
+                    throw new IllegalStateException("Illegal type: " + columnSchema.getSqlType());
             }
         }
 

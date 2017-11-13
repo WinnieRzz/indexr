@@ -11,8 +11,8 @@ import java.util.List;
 import io.indexr.segment.Row;
 import io.indexr.segment.Segment;
 import io.indexr.segment.SegmentFd;
-import io.indexr.segment.pack.IndexMemCache;
-import io.indexr.segment.pack.PackMemCache;
+import io.indexr.segment.cache.IndexMemCache;
+import io.indexr.segment.cache.PackMemCache;
 import io.indexr.util.Try;
 
 /**
@@ -51,7 +51,7 @@ public class SegmentFdRowIterator implements Iterator<Row>, Closeable {
                 nextIndex++;
                 //System.out.printf("next segment: [%s]\n", rts.name());
                 try {
-                    current = segmentFd.open(indexMemCache, packMemCache);
+                    current = segmentFd.open(indexMemCache, null, packMemCache);
                 } catch (IOException e) {
                     throw new RuntimeException(e);
                 }

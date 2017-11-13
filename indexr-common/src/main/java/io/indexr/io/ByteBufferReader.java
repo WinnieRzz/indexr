@@ -2,8 +2,8 @@ package io.indexr.io;
 
 import com.google.common.base.Preconditions;
 
-import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileStatus;
+import org.apache.spark.unsafe.Platform;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -12,28 +12,38 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 
-import io.indexr.util.ByteBufferUtil;
 import io.indexr.util.IOUtil;
 
 public interface ByteBufferReader extends Closeable {
     /**
-     * Read exactly <i>size</i>s bytes from this ByteBufferReader from <i>offset</i> position into <i>dst</i>.
-     * <p/>
+     * Read exactly <i>size</i>s bytes from this ByteBufferReader from <i>position</i> into <i>dst</i>.
+     *
      * Whether this function may or may not change the position of datasource is implementation specific.
      */
-    void read(long offset, ByteBuffer dst, int size) throws IOException;
+    void read(long position, ByteBuffer dst) throws IOException;
 
-    /**
-     * Read exactly <i>size</i>s bytes.
-     * Normally used to fetch small info data. Slower than {@link #read(long, ByteBuffer, int)} is expected.
-     */
-    default byte[] read(long offset, int size) throws IOException {
-        ByteBuffer buffer = ByteBufferUtil.allocateHeap(size);
-        read(offset, buffer, size);
-        return buffer.array();
+    default void read(long position, byte[] buffer, int offset, int length) throws IOException {
+        ByteBuffer byteBuffer = ByteBuffer.wrap(buffer);
+        byteBuffer.position(offset);
+        byteBuffer.limit(offset + length);
+        read(position, byteBuffer);
     }
 
-    default boolean exists(long offset) throws IOException {
+    // Those method sshould only used in test/assert senario.
+
+    default int readInt(long position) throws IOException {
+        byte[] valBuffer = new byte[4];
+        read(position, valBuffer, 0, 4);
+        return Platform.getInt(valBuffer, Platform.BYTE_ARRAY_OFFSET);
+    }
+
+    default long readLong(long position) throws IOException {
+        byte[] valBuffer = new byte[8];
+        read(position, valBuffer, 0, 8);
+        return Platform.getLong(valBuffer, Platform.BYTE_ARRAY_OFFSET);
+    }
+
+    default boolean exists(long position) throws IOException {
         return true;
     }
 
@@ -47,6 +57,13 @@ public interface ByteBufferReader extends Closeable {
         ByteBufferReader open(long readBase) throws IOException;
 
         /**
+         * Only open when read methods are called.
+         */
+        default ByteBufferReader openOnRead(long readBase) throws IOException {
+            return new OpenOnReadBBR(this, readBase);
+        }
+
+        /**
          * Wrap a ByteBufferReader into an {@link Opener}.
          * Note that the close will <b>not</b> passed to the opener,
          */
@@ -57,9 +74,9 @@ public interface ByteBufferReader extends Closeable {
             return b -> ByteBufferReader.of(reader, b, null);
         }
 
-        static Opener create(FSDataInputStream input, long size) {
-            return b -> ByteBufferReader.of(input, size, b, null);
-        }
+        //static Opener create(FSDataInputStream input, long size) {
+        //    return b -> ByteBufferReader.of(input, size, b, null);
+        //}
 
         static Opener create(FileChannel file) {
             return b -> ByteBufferReader.of(file, b, null);
@@ -78,25 +95,25 @@ public interface ByteBufferReader extends Closeable {
             };
         }
 
-        static Opener create(org.apache.hadoop.fs.FileSystem fileSystem, org.apache.hadoop.fs.Path path) {
-            return b -> {
-                FileStatus status = fileSystem.getFileStatus(path);
-                Preconditions.checkState(status != null, "File on %s not exists", path.toString());
-                Preconditions.checkState(status.isFile(), "%s should be a file", path.toString());
+        static Opener create(org.apache.hadoop.fs.FileSystem fileSystem,
+                             org.apache.hadoop.fs.Path path) throws IOException {
+            FileStatus status = fileSystem.getFileStatus(path);
+            Preconditions.checkState(status != null, "File on %s not exists", path.toString());
+            Preconditions.checkState(status.isFile(), "%s should be a file", path.toString());
 
-                FSDataInputStream stream = fileSystem.open(path);
-                ByteBufferReader bbr = ByteBufferReader.of(stream, status.getLen(), b, stream);
-                bbr.setName(path.toString());
-                return bbr;
+            long size = status.getLen();
+            int blockCount = fileSystem.getFileBlockLocations(status, 0, size).length;
+            return b -> {
+                return DFSByteBufferReader.open(fileSystem, path, size, blockCount, b);
             };
         }
 
-        static Opener create(org.apache.hadoop.fs.FileSystem fileSystem, org.apache.hadoop.fs.Path path, long size) {
+        static Opener create(org.apache.hadoop.fs.FileSystem fileSystem,
+                             org.apache.hadoop.fs.Path path,
+                             long size,
+                             int blockCount) throws IOException {
             return b -> {
-                FSDataInputStream stream = fileSystem.open(path);
-                ByteBufferReader bbr = ByteBufferReader.of(stream, size, b, stream);
-                bbr.setName(path.toString());
-                return bbr;
+                return DFSByteBufferReader.open(fileSystem, path, size, blockCount, b);
             };
         }
     }
@@ -104,56 +121,18 @@ public interface ByteBufferReader extends Closeable {
     public static ByteBufferReader of(ByteBufferReader reader, long readBase, Closeable close) throws IOException {
         return new ByteBufferReader() {
             @Override
-            public void read(long offset, ByteBuffer dst, int size) throws IOException {
-                reader.read(readBase + offset, dst, size);
+            public void read(long position, ByteBuffer dst) throws IOException {
+                reader.read(readBase + position, dst);
             }
 
             @Override
-            public boolean exists(long offset) throws IOException {
-                return reader.exists(readBase + offset);
+            public void read(long position, byte[] buffer, int offset, int length) throws IOException {
+                reader.read(readBase + position, buffer, offset, length);
             }
 
             @Override
-            public void close() throws IOException {
-                if (close != null) {
-                    close.close();
-                }
-            }
-        };
-    }
-
-    /**
-     * Create a ByteBufferReader by {@link FSDataInputStream}.
-     * Unfortunately, the reader returned is not multi-thread safe because {@link FSDataInputStream} doesn't provide
-     * appropriate api. And the pos will move to last read position.
-     */
-    public static ByteBufferReader of(FSDataInputStream input, long fileSize, long readBase, Closeable close) throws IOException {
-        return new ByteBufferReader() {
-            String name;
-
-            @Override
-            public void read(long offset, ByteBuffer dst, int size) throws IOException {
-                try {
-                    IOUtil.readFully(input, readBase + offset, dst, size);
-                } catch (Exception e) {
-                    throw new IOException(String.format("name: %s", name), e);
-                }
-            }
-
-            @Override
-            public byte[] read(long offset, int size) throws IOException {
-                try {
-                    byte[] bytes = new byte[size];
-                    input.readFully(offset, bytes);
-                    return bytes;
-                } catch (Exception e) {
-                    throw new IOException(String.format("name: %s", name), e);
-                }
-            }
-
-            @Override
-            public boolean exists(long offset) throws IOException {
-                return offset >= 0 && readBase + offset < fileSize;
+            public boolean exists(long position) throws IOException {
+                return reader.exists(readBase + position);
             }
 
             @Override
@@ -161,11 +140,6 @@ public interface ByteBufferReader extends Closeable {
                 if (close != null) {
                     close.close();
                 }
-            }
-
-            @Override
-            public void setName(String name) {
-                this.name = name;
             }
         };
     }
@@ -175,17 +149,17 @@ public interface ByteBufferReader extends Closeable {
             String name;
 
             @Override
-            public void read(long offset, ByteBuffer dst, int size) throws IOException {
+            public void read(long position, ByteBuffer dst) throws IOException {
                 try {
-                    IOUtil.readFully(file, readBase + offset, dst, size);
+                    IOUtil.readFully(file, readBase + position, dst);
                 } catch (Exception e) {
                     throw new IOException(String.format("name: %s", name), e);
                 }
             }
 
             @Override
-            public boolean exists(long offset) throws IOException {
-                return offset >= 0 && readBase + offset < file.size();
+            public boolean exists(long position) throws IOException {
+                return position >= 0 && readBase + position < file.size();
             }
 
             @Override
@@ -202,16 +176,22 @@ public interface ByteBufferReader extends Closeable {
         };
     }
 
-    public static ByteBufferReader of(ByteBuffer buffer, int readBase, Closeable close) throws IOException {
+    public static ByteBufferReader of(ByteBuffer byteBuffer, int readBase, Closeable close) throws IOException {
         return new ByteBufferReader() {
             @Override
-            public void read(long offset, ByteBuffer dst, int size) throws IOException {
-                IOUtil.readFully(buffer, (int) (readBase + offset), dst, size);
+            public void read(long position, ByteBuffer dst) throws IOException {
+                IOUtil.readFully(byteBuffer, (int) (readBase + position), dst, dst.remaining());
             }
 
             @Override
-            public boolean exists(long offset) throws IOException {
-                return offset >= 0 && readBase + offset < buffer.limit();
+            public void read(long position, byte[] buffer, int offset, int length) {
+                byteBuffer.position((int) position);
+                byteBuffer.get(buffer, offset, length);
+            }
+
+            @Override
+            public boolean exists(long position) throws IOException {
+                return position >= 0 && readBase + position < byteBuffer.limit();
             }
 
             @Override

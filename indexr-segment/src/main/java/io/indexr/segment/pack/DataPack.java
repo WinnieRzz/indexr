@@ -2,37 +2,51 @@ package io.indexr.segment.pack;
 
 import com.google.common.base.Preconditions;
 
+import com.carrotsearch.hppc.BitSetIterator;
+
+import org.apache.spark.unsafe.Platform;
 import org.apache.spark.unsafe.types.UTF8String;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 
+import io.indexr.data.ByteArraySetter;
 import io.indexr.data.BytePiece;
 import io.indexr.data.BytePieceSetter;
+import io.indexr.data.DictStruct;
 import io.indexr.data.DoubleSetter;
 import io.indexr.data.FloatSetter;
 import io.indexr.data.Freeable;
 import io.indexr.data.IntSetter;
 import io.indexr.data.LongSetter;
-import io.indexr.data.Sizable;
 import io.indexr.io.ByteBufferWriter;
 import io.indexr.io.ByteSlice;
 import io.indexr.segment.ColumnType;
 import io.indexr.segment.DPValues;
+import io.indexr.segment.PackDurationStat;
+import io.indexr.segment.SegmentMode;
+import io.indexr.segment.storage.PackBundle;
+import io.indexr.segment.storage.Version;
+import io.indexr.util.BitMap;
+import io.indexr.util.DirectBitMapIterator;
 import io.indexr.util.MemoryUtil;
+import io.indexr.util.Wrapper;
 
-public final class DataPack implements DPValues, Freeable, Sizable {
+public final class DataPack implements DPValues, Freeable {
     public static final int SHIFT = 16;
     public static final int MASK = 0XFFFF;
     public static final int MAX_COUNT = 1 << SHIFT;
 
-    final int version;
+    private final int version;
+    private final int objCount;
 
-    ByteSlice data; // Hold a reference, prevent memory from gc.
-    long dataAddr;
-    ByteSlice cmpData;
-    final int objCount;
-    final byte type;
+    private ByteSlice data; // Hold a reference, prevent memory from gc.
+    private long dataAddr;
+    private ByteSlice cmpData;
+
+    // For those dictionary encoded data.
+    private ByteSlice dictData;
+    private DictStruct dictStruct;
 
     public DataPack(ByteSlice data, ByteSlice cmpData, DataPackNode dpn) {
         this.data = data;
@@ -40,136 +54,143 @@ public final class DataPack implements DPValues, Freeable, Sizable {
             this.dataAddr = data.address();
         }
         this.cmpData = cmpData;
-        this.type = dpn.packType();
 
         this.version = dpn.version();
         this.objCount = dpn.objCount();
-        this.numType = dpn.numType();
-        this.minVal = dpn.uniformMin();
-        this.maxObjLen = dpn.maxObjLen();
+
+        // Hack code.
+        if (dpn instanceof DataPackNode_Basic) {
+            DataPackNode_Basic v0 = (DataPackNode_Basic) dpn;
+            this.numType = v0.numType();
+            this.minVal = v0.uniformMin();
+            this.maxObjLen = v0.maxObjLen();
+        } else {
+            this.numType = 0;
+            this.minVal = 0;
+            this.maxObjLen = 0;
+        }
     }
 
-    public int version() {
+    public final int version() {
         return version;
     }
 
-    long dataAddr() {
+    public final long dataAddr() {
         return dataAddr;
     }
 
-    public ByteSlice data() {
+    public final ByteSlice data() {
         return data;
     }
 
-    public ByteSlice cmpData() {
+    public final ByteSlice cmpData() {
         return cmpData;
     }
 
-    public int objCount() {
-        return objCount;
+    public final DictStruct dictStruct(byte dataType, DataPackNode dpn) {
+        if (dictStruct == null) {
+            long time = System.currentTimeMillis();
+
+            dictData = dpn.mode.versionAdapter.getDictStruct(version, dpn.mode(), dataType, dpn, cmpData);
+            dictStruct = new DictStruct(dataType, dictData.address());
+
+            PackDurationStat.INSTANCE.add_compressPack(System.currentTimeMillis() - time);
+        }
+        return dictStruct;
     }
 
-    public boolean isFull() {
-        return objCount() >= MAX_COUNT;
+    @Override
+    public final int valueCount() {
+        return objCount;
     }
 
     /**
      * Bytes on disk.
      */
-    public int serializedSize() {
+    public final int serializedSize() {
         return cmpData.size();
     }
 
-    /**
-     * Bytes in uncompressed.
-     */
     @Override
-    public long size() {
-        return data.size();
-    }
-
-    public static DataPack from(ByteSlice buffer, DataPackNode dpn) {
-        return new DataPack(null, buffer, dpn);
-    }
-
-    @Override
-    public void free() {
-        if (data != null) {
+    public final void free() {
+        if (data != null && data == cmpData) {
+            // It could happen in uncompressed mode.
             data.free();
             data = null;
-        }
-        if (cmpData != null) {
-            cmpData.free();
             cmpData = null;
+        } else {
+            if (data != null) {
+                data.free();
+                data = null;
+            }
+            if (cmpData != null) {
+                cmpData.free();
+                cmpData = null;
+            }
         }
+        if (dictData != null) {
+            dictData.free();
+            dictData = null;
+        }
+        dictStruct = null;
     }
 
-    @Override
-    public int count() {
-        return objCount();
+    public final void write(ByteBufferWriter writer) throws IOException {
+        Preconditions.checkState(cmpData != null);
+        writer.write(cmpData.toByteBuffer());
     }
 
-    public final void compress(DataPackNode dpn) {
+    /**
+     * Note that this method could update the content of dpn.
+     * Make sure to call this method before you actually save the dpn instance to storage.
+     */
+    public final Object compress(byte dataType, boolean isIndexed, DataPackNode dpn) {
+        assert version == dpn.version();
+        if (cmpData != null) {
+            return null;
+        }
         long time = System.currentTimeMillis();
 
-        Preconditions.checkState(data != null && cmpData == null);
+        Wrapper extraInfo = new Wrapper();
         if (dpn.compress()) {
-            cmpData = doCompress(dpn, data);
-            data.free();
-            data = null;
+            cmpData = dpn.mode.versionAdapter.compressPack(version, dpn.mode(), dataType, isIndexed, dpn, data, extraInfo);
         } else {
             cmpData = data;
         }
 
-        data = null;
-        dataAddr = 0;
-
         PackDurationStat.INSTANCE.add_compressPack(System.currentTimeMillis() - time);
+
+        return extraInfo.value;
     }
 
-    public final void decompress(DataPackNode dpn) {
+    public final void decompress(byte dataType, DataPackNode dpn) {
+        assert version == dpn.version();
+        if (data != null) {
+            return;
+        }
         long time = System.currentTimeMillis();
 
-        Preconditions.checkState(data == null && cmpData != null);
         if (dpn.compress()) {
-            data = doDecompress(dpn, cmpData);
-            cmpData.free();
+            if (dpn.isDictEncoded()) {
+                // Special case for dictionary encoded data.
+                data = dpn.mode.versionAdapter.getDataFromDictStruct(version, dpn.mode, dataType, dpn, dictStruct(dataType, dpn));
+            } else {
+                data = dpn.mode.versionAdapter.decompressPack(version, dpn.mode(), dataType, dpn, cmpData);
+            }
         } else {
             data = cmpData;
         }
         dataAddr = data.address();
 
-        cmpData = null;
-
         PackDurationStat.INSTANCE.add_decompressPack(System.currentTimeMillis() - time);
-    }
-
-    ByteSlice doCompress(DataPackNode dpn, ByteSlice data) {
-        if (type == DataPackType.Number) {
-            return DataPack_N.doCompress(this, dpn, data);
-        } else {
-            return DataPack_R.doCompress(this, dpn, data);
-        }
-    }
-
-    ByteSlice doDecompress(DataPackNode dpn, ByteSlice cmpData) {
-        if (type == DataPackType.Number) {
-            return DataPack_N.doDecompress(this, dpn, cmpData);
-        } else {
-            return DataPack_R.doDecompress(this, dpn, cmpData);
-        }
-    }
-
-    public void write(ByteBufferWriter writer) throws IOException {
-        Preconditions.checkState(cmpData != null);
-        writer.write(cmpData.toByteBuffer(), cmpData.size());
     }
 
     // --------------------------------------------------------
     // Number data pack.
 
-    byte numType;
-    long minVal;
+    // Only used by Version.VERSION_0_ID
+    private final byte numType;
+    private final long minVal;
 
     @Override
     public long uniformValAt(int index, byte type) {
@@ -249,6 +270,40 @@ public final class DataPack implements DPValues, Freeable, Sizable {
         }
     }
 
+    public int foreach(BitMap position, IntSetter setter) {
+        if (position == BitMap.ALL) {
+            foreach(0, objCount, setter);
+            return objCount;
+        }
+        DirectBitMapIterator posIterator = position.iterator();
+        int count = 0;
+        switch (version) {
+            case Version.VERSION_0_ID: {
+                int index;
+                while ((index = posIterator.nextSetBit()) != BitSetIterator.NO_MORE) {
+                    if (index >= objCount) {
+                        break;
+                    }
+                    setter.set(index, (int) NumOp.getVal(numType, dataAddr, index, minVal));
+                    count++;
+                }
+                break;
+            }
+            default: {
+                int index;
+                while ((index = posIterator.nextSetBit()) != BitSetIterator.NO_MORE) {
+                    if (index >= objCount) {
+                        break;
+                    }
+                    setter.set(index, NumOp.getInt(dataAddr, index));
+                    count++;
+                }
+                break;
+            }
+        }
+        return count;
+    }
+
     @Override
     public void foreach(int start, int count, LongSetter setter) {
         int end = start + count;
@@ -264,6 +319,40 @@ public final class DataPack implements DPValues, Freeable, Sizable {
                 }
                 break;
         }
+    }
+
+    public int foreach(BitMap position, LongSetter setter) {
+        if (position == BitMap.ALL) {
+            foreach(0, objCount, setter);
+            return objCount;
+        }
+        DirectBitMapIterator posIterator = position.iterator();
+        int count = 0;
+        switch (version) {
+            case Version.VERSION_0_ID: {
+                int index;
+                while ((index = posIterator.nextSetBit()) != BitSetIterator.NO_MORE) {
+                    if (index >= objCount) {
+                        break;
+                    }
+                    setter.set(index, NumOp.getVal(numType, dataAddr, index, minVal));
+                    count++;
+                }
+                break;
+            }
+            default: {
+                int index;
+                while ((index = posIterator.nextSetBit()) != BitSetIterator.NO_MORE) {
+                    if (index >= objCount) {
+                        break;
+                    }
+                    setter.set(index, NumOp.getLong(dataAddr, index));
+                    count++;
+                }
+                break;
+            }
+        }
+        return count;
     }
 
     @Override
@@ -283,6 +372,40 @@ public final class DataPack implements DPValues, Freeable, Sizable {
         }
     }
 
+    public int foreach(BitMap position, FloatSetter setter) {
+        if (position == BitMap.ALL) {
+            foreach(0, objCount, setter);
+            return objCount;
+        }
+        DirectBitMapIterator posIterator = position.iterator();
+        int count = 0;
+        switch (version) {
+            case Version.VERSION_0_ID: {
+                int index;
+                while ((index = posIterator.nextSetBit()) != BitSetIterator.NO_MORE) {
+                    if (index >= objCount) {
+                        break;
+                    }
+                    setter.set(index, (float) Double.longBitsToDouble(NumOp.getVal(numType, dataAddr, index, minVal)));
+                    count++;
+                }
+                break;
+            }
+            default: {
+                int index;
+                while ((index = posIterator.nextSetBit()) != BitSetIterator.NO_MORE) {
+                    if (index >= objCount) {
+                        break;
+                    }
+                    setter.set(index, NumOp.getFloat(dataAddr, index));
+                    count++;
+                }
+                break;
+            }
+        }
+        return count;
+    }
+
     @Override
     public void foreach(int start, int count, DoubleSetter setter) {
         int end = start + count;
@@ -300,6 +423,40 @@ public final class DataPack implements DPValues, Freeable, Sizable {
         }
     }
 
+    public int foreach(BitMap position, DoubleSetter setter) {
+        if (position == BitMap.ALL) {
+            foreach(0, objCount, setter);
+            return objCount;
+        }
+        DirectBitMapIterator posIterator = position.iterator();
+        int count = 0;
+        switch (version) {
+            case Version.VERSION_0_ID: {
+                int index;
+                while ((index = posIterator.nextSetBit()) != BitSetIterator.NO_MORE) {
+                    if (index >= objCount) {
+                        break;
+                    }
+                    setter.set(index, Double.longBitsToDouble(NumOp.getVal(numType, dataAddr, index, minVal)));
+                    count++;
+                }
+                break;
+            }
+            default: {
+                int index;
+                while ((index = posIterator.nextSetBit()) != BitSetIterator.NO_MORE) {
+                    if (index >= objCount) {
+                        break;
+                    }
+                    setter.set(index, NumOp.getDouble(dataAddr, index));
+                    count++;
+                }
+                break;
+            }
+        }
+        return count;
+    }
+
     // --------------------------------------------------------
     // Raw data pack.
 
@@ -307,24 +464,52 @@ public final class DataPack implements DPValues, Freeable, Sizable {
     // | str_total_len | start0 | end0 | start1 | end1 | start2 | end2 | s0 | s1 | s2 |
     //         4       | <-                index(int)               -> |<- str_data ->|
 
-    // after v1:
+    // v1 later:
     // | offset0 | offset1 | offset2 | offset3(str_total_len) | s0 | s1 | s2 |
     // | <-                   index(int)                   -> |<- str_data ->|
 
-    int maxObjLen; // Only for v0.
 
-    @Override
-    public UTF8String stringValueAt(int index) {
+    private final int maxObjLen; // Only for v0.
+    private static final long[] EMPTY_START_END = new long[]{0, 0};
+
+    // Get the start and end pos of the raw type values.
+    //private long[] getRawValueStartEnd(int index) {
+    //    long startAddr, endAddr;
+    //    switch (version) {
+    //        case Version.VERSION_0_ID: {
+    //            if (maxObjLen == 0) {
+    //                return EMPTY_START_END;
+    //            }
+    //            long indexAddr = dataAddr + (index << 3) + 4;
+    //            int str_offset = (objCount << 3) + 4;
+    //            startAddr = MemoryUtil.getInt(indexAddr) + dataAddr + str_offset;
+    //            endAddr = MemoryUtil.getInt(indexAddr + 4) + dataAddr + str_offset;
+    //            break;
+    //        }
+    //        default: {
+    //            long indexAddr = dataAddr + (index << 2);
+    //            int str_offset = (objCount + 1) << 2;
+    //            startAddr = MemoryUtil.getInt(indexAddr) + dataAddr + str_offset;
+    //            endAddr = MemoryUtil.getInt(indexAddr + 4) + dataAddr + str_offset;
+    //            break;
+    //        }
+    //    }
+    //    return new long[]{startAddr, endAddr};
+    //}
+
+    public final UTF8String stringValueAt(int index) {
         long startAddr, endAddr;
         switch (version) {
             case Version.VERSION_0_ID: {
                 if (maxObjLen == 0) {
-                    return UTF8String.EMPTY_UTF8;
+                    startAddr = 0;
+                    endAddr = 0;
+                } else {
+                    long indexAddr = dataAddr + (index << 3) + 4;
+                    int str_offset = (objCount << 3) + 4;
+                    startAddr = MemoryUtil.getInt(indexAddr) + dataAddr + str_offset;
+                    endAddr = MemoryUtil.getInt(indexAddr + 4) + dataAddr + str_offset;
                 }
-                long indexAddr = dataAddr + (index << 3) + 4;
-                int str_offset = (objCount << 3) + 4;
-                startAddr = MemoryUtil.getInt(indexAddr) + dataAddr + str_offset;
-                endAddr = MemoryUtil.getInt(indexAddr + 4) + dataAddr + str_offset;
                 break;
             }
             default: {
@@ -335,6 +520,7 @@ public final class DataPack implements DPValues, Freeable, Sizable {
                 break;
             }
         }
+
         if (startAddr == endAddr) {
             return UTF8String.EMPTY_UTF8;
         } else {
@@ -342,20 +528,19 @@ public final class DataPack implements DPValues, Freeable, Sizable {
         }
     }
 
-    @Override
-    public void rawValueAt(int index, BytePiece bytes) {
+    public final void rawValueAt(int index, BytePiece bytes) {
         long startAddr, endAddr;
         switch (version) {
             case Version.VERSION_0_ID: {
                 if (maxObjLen == 0) {
-                    bytes.addr = 0;
-                    bytes.len = 0;
-                    return;
+                    startAddr = 0;
+                    endAddr = 0;
+                } else {
+                    long indexAddr = dataAddr + (index << 3) + 4;
+                    int str_offset = (objCount << 3) + 4;
+                    startAddr = MemoryUtil.getInt(indexAddr) + dataAddr + str_offset;
+                    endAddr = MemoryUtil.getInt(indexAddr + 4) + dataAddr + str_offset;
                 }
-                long indexAddr = dataAddr + (index << 3) + 4;
-                int str_offset = (objCount << 3) + 4;
-                startAddr = MemoryUtil.getInt(indexAddr) + dataAddr + str_offset;
-                endAddr = MemoryUtil.getInt(indexAddr + 4) + dataAddr + str_offset;
                 break;
             }
             default: {
@@ -366,23 +551,27 @@ public final class DataPack implements DPValues, Freeable, Sizable {
                 break;
             }
         }
+
         bytes.base = null;
         bytes.addr = startAddr;
         bytes.len = (int) (endAddr - startAddr);
     }
 
-    @Override
-    public byte[] rawValueAt(int index) {
+    private static final byte[] EMPTY_BYTES = new byte[0];
+
+    public final byte[] rawValueAt(int index) {
         long startAddr, endAddr;
         switch (version) {
             case Version.VERSION_0_ID: {
                 if (maxObjLen == 0) {
-                    return new byte[0];
+                    startAddr = 0;
+                    endAddr = 0;
+                } else {
+                    long indexAddr = dataAddr + (index << 3) + 4;
+                    int str_offset = (objCount << 3) + 4;
+                    startAddr = MemoryUtil.getInt(indexAddr) + dataAddr + str_offset;
+                    endAddr = MemoryUtil.getInt(indexAddr + 4) + dataAddr + str_offset;
                 }
-                long indexAddr = dataAddr + (index << 3) + 4;
-                int str_offset = (objCount << 3) + 4;
-                startAddr = MemoryUtil.getInt(indexAddr) + dataAddr + str_offset;
-                endAddr = MemoryUtil.getInt(indexAddr + 4) + dataAddr + str_offset;
                 break;
             }
             default: {
@@ -393,27 +582,30 @@ public final class DataPack implements DPValues, Freeable, Sizable {
                 break;
             }
         }
+
         if (startAddr == endAddr) {
-            return new byte[0];
+            return EMPTY_BYTES;
         } else {
             int len = (int) (endAddr - startAddr);
             byte[] bytes = new byte[len];
-            MemoryUtil.getBytes(startAddr, bytes, 0, len);
+            MemoryUtil.copyMemory(null, startAddr, bytes, Platform.BYTE_ARRAY_OFFSET, len);
             return bytes;
         }
     }
 
-    public ByteBuffer valueAt(int index) {
+    public final ByteBuffer valueAt(int index) {
         long startAddr, endAddr;
         switch (version) {
             case Version.VERSION_0_ID: {
                 if (maxObjLen == 0) {
-                    return ByteSlice.EmptyByteBuffer;
+                    startAddr = 0;
+                    endAddr = 0;
+                } else {
+                    long indexAddr = dataAddr + (index << 3) + 4;
+                    int str_offset = (objCount << 3) + 4;
+                    startAddr = MemoryUtil.getInt(indexAddr) + dataAddr + str_offset;
+                    endAddr = MemoryUtil.getInt(indexAddr + 4) + dataAddr + str_offset;
                 }
-                long indexAddr = dataAddr + (index << 3) + 4;
-                int str_offset = (objCount << 3) + 4;
-                startAddr = MemoryUtil.getInt(indexAddr) + dataAddr + str_offset;
-                endAddr = MemoryUtil.getInt(indexAddr + 4) + dataAddr + str_offset;
                 break;
             }
             default: {
@@ -424,6 +616,7 @@ public final class DataPack implements DPValues, Freeable, Sizable {
                 break;
             }
         }
+
         if (startAddr == endAddr) {
             return ByteSlice.EmptyByteBuffer;
         } else {
@@ -432,50 +625,150 @@ public final class DataPack implements DPValues, Freeable, Sizable {
     }
 
     @Override
-    public void foreach(int start, int count, BytePieceSetter setter) {
+    public final void foreach(int start, int count, BytePieceSetter setter) {
         BytePiece bytes = new BytePiece();
-        int end = start + count;
         switch (version) {
-            case Version.VERSION_0_ID: {
-                int str_offset = (objCount << 3) + 4;
-                for (int index = start; index < end; index++) {
+            case Version.VERSION_0_ID:
+                for (int index = start; index < start + count; index++) {
+                    long startAddr, endAddr;
+
                     if (maxObjLen == 0) {
-                        bytes.addr = 0;
-                        bytes.len = 0;
-                        continue;
+                        startAddr = 0;
+                        endAddr = 0;
+                    } else {
+                        long indexAddr = dataAddr + (index << 3) + 4;
+                        int str_offset = (objCount << 3) + 4;
+                        startAddr = MemoryUtil.getInt(indexAddr) + dataAddr + str_offset;
+                        endAddr = MemoryUtil.getInt(indexAddr + 4) + dataAddr + str_offset;
                     }
-                    long indexAddr = dataAddr + (index << 3) + 4;
-                    long startAddr = MemoryUtil.getInt(indexAddr) + dataAddr + str_offset;
-                    long endAddr = MemoryUtil.getInt(indexAddr + 4) + dataAddr + str_offset;
 
                     bytes.addr = startAddr;
                     bytes.len = (int) (endAddr - startAddr);
                     setter.set(index, bytes);
                 }
                 break;
-            }
-            default: {
-                int str_offset = (objCount + 1) << 2;
-                for (int index = start; index < end; index++) {
+            default:
+                for (int index = start; index < start + count; index++) {
+                    long startAddr, endAddr;
+
                     long indexAddr = dataAddr + (index << 2);
-                    long startAddr = MemoryUtil.getInt(indexAddr) + dataAddr + str_offset;
-                    long endAddr = MemoryUtil.getInt(indexAddr + 4) + dataAddr + str_offset;
+                    int str_offset = (objCount + 1) << 2;
+                    startAddr = MemoryUtil.getInt(indexAddr) + dataAddr + str_offset;
+                    endAddr = MemoryUtil.getInt(indexAddr + 4) + dataAddr + str_offset;
 
                     bytes.addr = startAddr;
                     bytes.len = (int) (endAddr - startAddr);
                     setter.set(index, bytes);
                 }
-                break;
-            }
         }
     }
 
+    @Override
+    public final void foreach(int start, int count, ByteArraySetter setter) {
+        switch (version) {
+            case Version.VERSION_0_ID:
+                for (int index = start; index < start + count; index++) {
+                    long startAddr, endAddr;
+
+                    if (maxObjLen == 0) {
+                        startAddr = 0;
+                        endAddr = 0;
+                    } else {
+                        long indexAddr = dataAddr + (index << 3) + 4;
+                        int str_offset = (objCount << 3) + 4;
+                        startAddr = MemoryUtil.getInt(indexAddr) + dataAddr + str_offset;
+                        endAddr = MemoryUtil.getInt(indexAddr + 4) + dataAddr + str_offset;
+                    }
+
+                    int len = (int) (endAddr - startAddr);
+                    byte[] bytes = new byte[len];
+                    MemoryUtil.copyMemory(null, startAddr, bytes, Platform.BYTE_ARRAY_OFFSET, len);
+
+                    setter.set(index, bytes, 0, len);
+                }
+                break;
+            default:
+                for (int index = start; index < start + count; index++) {
+                    long startAddr, endAddr;
+
+                    long indexAddr = dataAddr + (index << 2);
+                    int str_offset = (objCount + 1) << 2;
+                    startAddr = MemoryUtil.getInt(indexAddr) + dataAddr + str_offset;
+                    endAddr = MemoryUtil.getInt(indexAddr + 4) + dataAddr + str_offset;
+
+                    int len = (int) (endAddr - startAddr);
+                    byte[] bytes = new byte[len];
+                    MemoryUtil.copyMemory(null, startAddr, bytes, Platform.BYTE_ARRAY_OFFSET, len);
+
+                    setter.set(index, bytes, 0, len);
+                }
+        }
+    }
+
+    public int foreach(BitMap position, BytePieceSetter setter) {
+        if (position == BitMap.ALL) {
+            foreach(0, objCount, setter);
+            return objCount;
+        }
+        DirectBitMapIterator posIterator = position.iterator();
+        int count = 0;
+        BytePiece bytes = new BytePiece();
+        int index;
+
+        switch (version) {
+            case Version.VERSION_0_ID:
+                while ((index = posIterator.nextSetBit()) != BitSetIterator.NO_MORE) {
+                    if (index >= objCount) {
+                        break;
+                    }
+
+                    long startAddr, endAddr;
+                    if (maxObjLen == 0) {
+                        startAddr = 0;
+                        endAddr = 0;
+                    } else {
+                        long indexAddr = dataAddr + (index << 3) + 4;
+                        int str_offset = (objCount << 3) + 4;
+                        startAddr = MemoryUtil.getInt(indexAddr) + dataAddr + str_offset;
+                        endAddr = MemoryUtil.getInt(indexAddr + 4) + dataAddr + str_offset;
+                    }
+
+                    bytes.addr = startAddr;
+                    bytes.len = (int) (endAddr - startAddr);
+                    setter.set(index, bytes);
+
+                    count++;
+                }
+                break;
+            default:
+                while ((index = posIterator.nextSetBit()) != BitSetIterator.NO_MORE) {
+                    if (index >= objCount) {
+                        break;
+                    }
+
+                    long startAddr, endAddr;
+
+                    long indexAddr = dataAddr + (index << 2);
+                    int str_offset = (objCount + 1) << 2;
+                    startAddr = MemoryUtil.getInt(indexAddr) + dataAddr + str_offset;
+                    endAddr = MemoryUtil.getInt(indexAddr + 4) + dataAddr + str_offset;
+
+                    bytes.addr = startAddr;
+                    bytes.len = (int) (endAddr - startAddr);
+                    setter.set(index, bytes);
+
+                    count++;
+                }
+        }
+
+        return count;
+    }
 
     // --------------------------------------------------------
     // Utils.
 
     /**
-     * Get pack count from row count.
+     * Get pack valueCount from row valueCount.
      */
     public static int rowCountToPackCount(long count) {
         return (int) ((count + MASK) >>> SHIFT);
@@ -496,7 +789,7 @@ public final class DataPack implements DPValues, Freeable, Sizable {
     }
 
     /**
-     * Get the row count of the pack by packId.
+     * Get the row valueCount of the pack by packId.
      */
     public static int packRowCount(long rowCount, int packId) {
         int packCount = rowCountToPackCount(rowCount);
@@ -507,5 +800,13 @@ public final class DataPack implements DPValues, Freeable, Sizable {
             int packRowCount = (int) (rowCount & MASK);
             return packRowCount == 0 ? DataPack.MAX_COUNT : packRowCount;
         }
+    }
+
+
+    // --------------------------------------------------------
+    // Factory.
+
+    public static interface Factory {
+        PackBundle createPackBundle(int version, SegmentMode mode, byte dataType, boolean isIndexed, VirtualDataPack cache);
     }
 }

@@ -9,7 +9,6 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang.RandomStringUtils;
 import org.apache.commons.lang.StringUtils;
-import org.apache.directory.api.util.Strings;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
 import org.apache.hadoop.fs.FileSystem;
@@ -51,15 +50,19 @@ import java.util.Arrays;
 import java.util.List;
 
 import io.indexr.io.ByteBufferReader;
-import io.indexr.segment.ColumnType;
-import io.indexr.segment.pack.IntegratedSegment;
-import io.indexr.segment.pack.StorageSegment;
-import io.indexr.segment.pack.UpdateColSchema;
-import io.indexr.segment.pack.UpdateColSegment;
+import io.indexr.segment.SQLType;
+import io.indexr.segment.storage.StorageSegment;
+import io.indexr.segment.storage.UpdateColSchema;
+import io.indexr.segment.storage.UpdateColSegment;
+import io.indexr.segment.storage.itg.IntegratedSegment;
 import io.indexr.server.IndexRConfig;
 import io.indexr.server.SegmentHelper;
+import io.indexr.server.TableSchema;
+import io.indexr.server.ZkTableManager;
+import io.indexr.server.rt.RealtimeConfig;
 import io.indexr.util.JsonUtil;
 import io.indexr.util.RuntimeUtil;
+import io.indexr.util.Strings;
 import io.indexr.util.Try;
 
 /**
@@ -207,6 +210,10 @@ public class UpdateColumnJob extends Configured implements Tool {
 
                     DistributedFileSystem fileSystem = (DistributedFileSystem) FileSystem.get(jobContext.getConfiguration());
                     Path tmpSegDir = new Path(jobContext.getWorkingDirectory(), TMP_SEG_DIR);
+                    if (!fileSystem.exists(tmpSegDir)) {
+                        log.warn("Segment tmp dir not found");
+                        return;
+                    }
                     try {
                         tmpSegDir = fileSystem.resolvePath(tmpSegDir);
                         String tmpSegDirStr = tmpSegDir.toString() + "/";
@@ -408,7 +415,7 @@ public class UpdateColumnJob extends Configured implements Tool {
             } catch (JsonProcessingException e) {
                 // this schema is not specified by json.
                 String[] strs = columns.split(",");
-                updateColSchemas = Lists.transform(Arrays.asList(strs), s -> new UpdateColSchema(s, ColumnType.STRING)); // type is not used.
+                updateColSchemas = Lists.transform(Arrays.asList(strs), s -> new UpdateColSchema(s, SQLType.VARCHAR, false, s)); // type is not used.
             }
         } else {
             System.out.println("please specify update mode -[add|del|alt]");
@@ -419,10 +426,16 @@ public class UpdateColumnJob extends Configured implements Tool {
             return 1;
         }
 
-        System.out.printf("table: %s, mode: %s, columns: %s\n", options.table, mode, JsonUtil.toJson(updateColSchemas));
+        log.debug("table: {}, mode: {}, columns: {}", options.table, mode, JsonUtil.toJson(updateColSchemas));
 
         IndexRConfig indexrConf = new IndexRConfig();
-        String segmentRoot = IndexRConfig.segmentRootPath(indexrConf.getDataRoot(), options.table);
+        ZkTableManager zkTableManager = new ZkTableManager(indexrConf.getZkClient());
+        TableSchema schema = zkTableManager.getTableSchema(options.table);
+
+        String segmentRoot = IndexRConfig.segmentRootPath(
+                indexrConf.getDataRoot(),
+                options.table,
+                schema.location).toString();
         Config config = new Config(
                 options.table,
                 segmentRoot,
@@ -432,6 +445,7 @@ public class UpdateColumnJob extends Configured implements Tool {
     }
 
     public static void main(String[] args) throws Exception {
+        RealtimeConfig.loadSubtypes();
         System.exit(ToolRunner.run(new Configuration(), new UpdateColumnJob(), args));
     }
 
@@ -450,7 +464,9 @@ public class UpdateColumnJob extends Configured implements Tool {
         @Option(name = "-col", metaVar = "<cols>", usage = "for del mode, list the column names, e.g. old_col,old_col2;" +
                 "\nfor add or alt mode, specify column schemas, e.g." +
                 "\n[{\"name\": \"new_col1\", \"dataType\": \"long\", \"value\": \"old_col\"}," +
-                "\n{\"name\": \"new_col2\", \"string\": \"long\", \"value\": \"cast(old_col + old_col2, string)\"}]")
+                "\n{\"name\": \"new_col2\", \"string\": \"long\", \"value\": \"cast(old_col + old_col2, string)\"}]" +
+                "\nNote that normally we put those json into a file and point it by @fileName." +
+                "\ne.g. bin/upcol.sh -add -t test -col @addcols.json")
         String columns;
     }
 }

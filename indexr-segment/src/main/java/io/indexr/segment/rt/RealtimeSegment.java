@@ -3,7 +3,6 @@ package io.indexr.segment.rt;
 import com.google.common.base.Preconditions;
 
 import org.apache.commons.io.IOUtils;
-import org.apache.directory.api.util.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -28,21 +27,25 @@ import io.indexr.segment.InfoSegment;
 import io.indexr.segment.RowTraversal;
 import io.indexr.segment.Segment;
 import io.indexr.segment.SegmentFd;
+import io.indexr.segment.SegmentMode;
 import io.indexr.segment.SegmentSchema;
-import io.indexr.segment.pack.ColumnNode;
-import io.indexr.segment.pack.DPSegment;
-import io.indexr.segment.pack.IndexMemCache;
-import io.indexr.segment.pack.IntegratedSegment;
-import io.indexr.segment.pack.OpenOption;
-import io.indexr.segment.pack.PackMemCache;
+import io.indexr.segment.cache.ExtIndexMemCache;
+import io.indexr.segment.cache.IndexMemCache;
+import io.indexr.segment.cache.PackMemCache;
+import io.indexr.segment.storage.ColumnNode;
+import io.indexr.segment.storage.DPSegment;
+import io.indexr.segment.storage.OpenOption;
+import io.indexr.segment.storage.itg.IntegratedSegment;
 import io.indexr.util.ByteBufferUtil;
 import io.indexr.util.Holder;
 import io.indexr.util.IOUtil;
 import io.indexr.util.Serializable;
+import io.indexr.util.Strings;
 import io.indexr.util.Try;
 
 public class RealtimeSegment implements InfoSegment, SegmentFd {
     private static final Logger logger = LoggerFactory.getLogger(RealtimeSegment.class);
+
     private static final Map<UTF8Row, UTF8Row> zeroRows = new HashMap<>(0);
     private static final int ROW_BUFFER_SIZE = 1 << 16;
 
@@ -176,7 +179,7 @@ public class RealtimeSegment implements InfoSegment, SegmentFd {
                                List<Metric> metrics,
                                Map<String, String> nameToAlias,
                                TagSetting tagSetting,
-                               int ignoreStrategy,
+                               EventIgnoreStrategy ignoreStrategy,
                                boolean grouping,
                                Fetcher fetcher,
                                int maxRow,
@@ -207,7 +210,7 @@ public class RealtimeSegment implements InfoSegment, SegmentFd {
      * @param maxRow         -1 means no limit.
      * @param maxPeriod      -1 means no limit.
      * @param writeCommitLog write commit log or not.
-     * @return The row count we got in realtime segment.
+     * @return The row valueCount we got in realtime segment.
      */
     private long ingestRows(
             List<String> dims,
@@ -215,7 +218,7 @@ public class RealtimeSegment implements InfoSegment, SegmentFd {
             Map<String, String> nameToAlias,
             boolean grouping,
             TagSetting tagSetting,
-            int ignoreStrategy,
+            EventIgnoreStrategy ignoreStrategy,
             Fetcher fetcher,
             int maxRow,
             long maxPeriod,
@@ -440,42 +443,43 @@ public class RealtimeSegment implements InfoSegment, SegmentFd {
     /**
      * Persistence rows in memory to local disk.
      */
-    public SegmentFd saveToDisk(int version, boolean compress, RTResources rtResources) throws IOException {
+    public SegmentFd saveToDisk(int version, SegmentMode mode, RTResources rtResources) throws IOException {
         logger.debug("Start save in-memory rows to disk. [segment: {}]", name);
         long lastTime = System.currentTimeMillis();
 
+        SegmentFd integratedSegment;
         Path dumpPath = path.resolve("dump");
-        DPSegment dpSegment = DPSegment.open(version, dumpPath, name, schema, OpenOption.Overwrite);
-        dpSegment.update().setCompress(compress);
-        boolean ok = true;
-        long rowCount = 0;
-        for (UTF8Row row : rowsInMemory.values()) {
-            if (Thread.interrupted()) {
-                ok = false;
-                break;
-            } else {
-                dpSegment.add(row);
-                rowCount++;
+        try (DPSegment dpSegment = DPSegment.open(version, mode, dumpPath, name, schema, OpenOption.Overwrite)) {
+            dpSegment.update();
+            boolean ok = true;
+            long rowCount = 0;
+            for (UTF8Row row : rowsInMemory.values()) {
+                if (Thread.interrupted()) {
+                    ok = false;
+                    break;
+                } else {
+                    dpSegment.add(row);
+                    rowCount++;
+                }
             }
+            if (!ok) {
+                logger.warn("Fail saveToDisk. [segment: {}]", name);
+                IOUtils.closeQuietly(dpSegment);
+                return null;
+            }
+            dpSegment.seal();
+
+            Path integratedPath = path.resolve("integrated");
+            integratedSegment = IntegratedSegment.Fd.create(dpSegment, integratedPath, true);
+
+            Preconditions.checkState(dpSegment.rowCount() == rowCount());
         }
-        if (!ok) {
-            logger.warn("Fail saveToDisk. [segment: {}]", name);
-            IOUtils.closeQuietly(dpSegment);
-            return null;
-        }
-        dpSegment.seal();
 
-        Path integratedPath = path.resolve("integrated");
-        SegmentFd integratedSegment = IntegratedSegment.Fd.create(dpSegment, integratedPath, true);
-
-        dpSegment.close();
-
-        Preconditions.checkState(dpSegment.rowCount() == rowCount());
         long memory = rowsMemoryUsage;
         setSavedSegment(integratedSegment, rtResources);
 
         logger.debug("Save [{}] rows completed, took [{}], release memory [{}K]. [segment: {}]",
-                rowCount,
+                rowCount(),
                 String.format("%.2fs", (double) (System.currentTimeMillis() - lastTime) / 1000),
                 memory >>> 10,
                 name);
@@ -496,9 +500,9 @@ public class RealtimeSegment implements InfoSegment, SegmentFd {
             Iterator<UTF8Row> it = map.values().iterator();
             while (it.hasNext()) {
                 UTF8Row row = it.next();
-                it.remove();
                 row.free();
             }
+            map.clear();
             Preconditions.checkState(map.isEmpty(), "Realtime rows map should be emptpy now.");
             rtResources.decMemoryUsage(memory);
         }
@@ -525,6 +529,16 @@ public class RealtimeSegment implements InfoSegment, SegmentFd {
     // Segment interface implementation
     // ============================================
 
+
+    @Override
+    public int version() {
+        return savedSegment != null ? savedSegment.info().version() : 0;
+    }
+
+    @Override
+    public SegmentMode mode() {
+        return savedSegment != null ? savedSegment.info().mode() : null;
+    }
 
     @Override
     public boolean isRealtime() {
@@ -566,25 +580,39 @@ public class RealtimeSegment implements InfoSegment, SegmentFd {
     }
 
     @Override
-    public Segment open(IndexMemCache indexMemCache, PackMemCache packMemCache) throws IOException {
+    public Segment open(IndexMemCache indexMemCache, ExtIndexMemCache extIndexMemCache, PackMemCache packMemCache) throws IOException {
         if (savedSegment != null) {
-            return savedSegment.open(indexMemCache, packMemCache);
+            return savedSegment.open(indexMemCache, extIndexMemCache, packMemCache);
         } else {
-            return new RTSeg(name, schema, rowsInMemory, rowInMemoryCount);
+            return new RTSeg(version(), mode(), name, schema, rowsInMemory, rowInMemoryCount);
         }
     }
 
     private static class RTSeg implements Segment {
+        final int version;
+        final SegmentMode mode;
         final String name;
         final SegmentSchema schema;
         final Map<UTF8Row, UTF8Row> rows;
         final long size;
 
-        public RTSeg(String name, SegmentSchema schema, Map<UTF8Row, UTF8Row> rows, long size) {
+        public RTSeg(int version, SegmentMode mode, String name, SegmentSchema schema, Map<UTF8Row, UTF8Row> rows, long size) {
+            this.version = version;
+            this.mode = mode;
             this.name = name;
             this.schema = schema;
             this.rows = rows;
             this.size = size;
+        }
+
+        @Override
+        public int version() {
+            return version;
+        }
+
+        @Override
+        public SegmentMode mode() {
+            return mode;
         }
 
         @Override

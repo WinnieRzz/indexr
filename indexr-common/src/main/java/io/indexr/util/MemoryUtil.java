@@ -1,7 +1,10 @@
 package io.indexr.util;
 
-import com.sun.jna.Native;
 import com.sun.management.OperatingSystemMXBean;
+
+import org.apache.hadoop.hdfs.BlockReader;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import sun.misc.Cleaner;
 import sun.misc.Unsafe;
@@ -12,9 +15,11 @@ import java.lang.reflect.Field;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
 
 // Copies from org.apache.cassandra.io.util.MemoryUtil.java
 public class MemoryUtil {
+    private static final Logger logger = LoggerFactory.getLogger(MemoryUtil.class);
     private static final long UNSAFE_COPY_THRESHOLD = 1024 * 1024L; // copied from java.nio.Bits
 
     public static final Unsafe unsafe;
@@ -33,19 +38,23 @@ public class MemoryUtil {
     private static final long STRING_VALUE_OFFSET;
 
     private static final boolean BIG_ENDIAN = ByteOrder.nativeOrder().equals(ByteOrder.BIG_ENDIAN);
+    private static int PAGE_SIZE = -1;
 
-    public static final boolean UNALIGNED;
-    public static final boolean INVERTED_ORDER;
+    public static boolean HDFS_READ_HACK_ENABLE;
+    private static long BlockReaderLocal_verifyChecksum;
+    private static long BlockReaderLocal_dataIn;
+    private static long DFSInputStream_verifyChecksum;
+    private static long DFSInputStream_blockReader;
 
     static {
-        String arch = System.getProperty("os.arch");
-        UNALIGNED = arch.equals("i386") || arch.equals("x86")
-                || arch.equals("amd64") || arch.equals("x86_64");
-        INVERTED_ORDER = UNALIGNED && !BIG_ENDIAN;
+        if (BIG_ENDIAN) {
+            throw new RuntimeException("We only suppot littel endian platform!");
+        }
         try {
             Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
             field.setAccessible(true);
             unsafe = (sun.misc.Unsafe) field.get(null);
+
             Class<?> clazz = ByteBuffer.allocateDirect(0).getClass();
             DIRECT_BYTE_BUFFER_ADDRESS_OFFSET = unsafe.objectFieldOffset(Buffer.class.getDeclaredField("address"));
             DIRECT_BYTE_BUFFER_CAPACITY_OFFSET = unsafe.objectFieldOffset(Buffer.class.getDeclaredField("capacity"));
@@ -63,13 +72,50 @@ public class MemoryUtil {
             BYTE_ARRAY_BASE_OFFSET = unsafe.arrayBaseOffset(byte[].class);
 
             STRING_VALUE_OFFSET = MemoryUtil.unsafe.objectFieldOffset(String.class.getDeclaredField("value"));
+
+
+            try {
+                BlockReaderLocal_verifyChecksum = unsafe.objectFieldOffset(Class.forName("org.apache.hadoop.hdfs.BlockReaderLocal").getDeclaredField("verifyChecksum"));
+                BlockReaderLocal_dataIn = unsafe.objectFieldOffset(Class.forName("org.apache.hadoop.hdfs.BlockReaderLocal").getDeclaredField("dataIn"));
+
+                DFSInputStream_verifyChecksum = unsafe.objectFieldOffset(Class.forName("org.apache.hadoop.hdfs.DFSInputStream").getDeclaredField("verifyChecksum"));
+                DFSInputStream_blockReader = unsafe.objectFieldOffset(Class.forName("org.apache.hadoop.hdfs.DFSInputStream").getDeclaredField("blockReader"));
+
+                HDFS_READ_HACK_ENABLE = true;
+            } catch (Exception e) {
+                HDFS_READ_HACK_ENABLE = false;
+                logger.warn("hdfs read hack is off because of error: {}", e.getCause());
+            }
         } catch (Exception e) {
             throw new AssertionError(e);
         }
     }
 
+    public static boolean getBlockReaderLocal_verifyChecksum(Object br) {return unsafe.getBoolean(br, BlockReaderLocal_verifyChecksum);}
+
+    public static void setBlockReaderLocal_verifyChecksum(Object br, boolean value) {unsafe.putBoolean(br, BlockReaderLocal_verifyChecksum, value);}
+
+    public static FileChannel getBlockReaderLocal_dataIn(Object br) {return (FileChannel) unsafe.getObject(br, BlockReaderLocal_dataIn);}
+
+    public static BlockReader getDFSInputStream_blockReader(Object br) {return (BlockReader) unsafe.getObject(br, DFSInputStream_blockReader);}
+
+    public static boolean getDFSInputStream_verifyChecksum(Object br) {return unsafe.getBoolean(br, DFSInputStream_verifyChecksum);}
+
+    public static void setDFSInputStream_verifyChecksum(Object br, boolean value) {unsafe.putBoolean(br, DFSInputStream_verifyChecksum, value);}
+
     public static int pageSize() {
-        return unsafe.pageSize();
+        if (PAGE_SIZE == -1) {
+            PAGE_SIZE = unsafe.pageSize();
+        }
+        return PAGE_SIZE;
+    }
+
+    public static void setMemory(long addr, long size, byte v) {
+        unsafe.setMemory(addr, size, v);
+    }
+
+    public static void setMemory(Object base, long offset, long size, byte v) {
+        unsafe.setMemory(base, offset, size, v);
     }
 
     public static long getAddress(ByteBuffer buffer) {
@@ -83,11 +129,13 @@ public class MemoryUtil {
     }
 
     public static long allocate(long size) {
-        return Native.malloc(size);
+        //return Native.malloc(size);
+        return unsafe.allocateMemory(size);
     }
 
     public static void free(long addr) {
-        Native.free(addr);
+        //Native.free(addr);
+        unsafe.freeMemory(addr);
     }
 
     public static void setByte(long address, byte b) {
@@ -99,31 +147,19 @@ public class MemoryUtil {
     }
 
     public static void setInt(long address, int l) {
-        if (UNALIGNED)
-            unsafe.putInt(address, l);
-        else
-            putIntByByte(address, l);
+        unsafe.putInt(address, l);
     }
 
     public static void setLong(long address, long l) {
-        if (UNALIGNED)
-            unsafe.putLong(address, l);
-        else
-            putLongByByte(address, l);
+        unsafe.putLong(address, l);
     }
 
     public static void setFloat(long address, float v) {
-        if (UNALIGNED)
-            unsafe.putFloat(address, v);
-        else
-            putIntByByte(address, Float.floatToRawIntBits(v));
+        unsafe.putFloat(address, v);
     }
 
     public static void setDouble(long address, double v) {
-        if (UNALIGNED)
-            unsafe.putDouble(address, v);
-        else
-            putLongByByte(address, Double.doubleToRawLongBits(v));
+        unsafe.putDouble(address, v);
     }
 
     public static byte getByte(long address) {
@@ -131,23 +167,23 @@ public class MemoryUtil {
     }
 
     public static int getShort(long address) {
-        return UNALIGNED ? unsafe.getShort(address) & 0xffff : getShortByByte(address);
+        return unsafe.getShort(address) & 0xffff;
     }
 
     public static int getInt(long address) {
-        return UNALIGNED ? unsafe.getInt(address) : getIntByByte(address);
+        return unsafe.getInt(address);
     }
 
     public static long getLong(long address) {
-        return UNALIGNED ? unsafe.getLong(address) : getLongByByte(address);
+        return unsafe.getLong(address);
     }
 
     public static float getFloat(long address) {
-        return UNALIGNED ? unsafe.getFloat(address) : Float.intBitsToFloat(getIntByByte(address));
+        return unsafe.getFloat(address);
     }
 
-    public static double getDoube(long address) {
-        return UNALIGNED ? unsafe.getDouble(address) : Double.longBitsToDouble(getLongByByte(address));
+    public static double getDouble(long address) {
+        return unsafe.getDouble(address);
     }
 
     private static class Deallocator implements Runnable {
@@ -176,6 +212,7 @@ public class MemoryUtil {
         } else {
             setByteBuffer(instance, address, length, null);
         }
+        instance.order(ByteOrder.nativeOrder());
         return instance;
     }
 

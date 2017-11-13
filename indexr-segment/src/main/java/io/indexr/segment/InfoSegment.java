@@ -2,12 +2,16 @@ package io.indexr.segment;
 
 import java.io.IOException;
 
-import io.indexr.segment.pack.ColumnNode;
+import io.indexr.segment.storage.ColumnNode;
 
 /**
- * An info segment continas basic info of a real segment.
+ * An info segment contains basic info of a real segment.
  */
 public interface InfoSegment {
+
+    int version();
+
+    SegmentMode mode();
 
     /**
      * Name of the segment. Unique in the whole system.

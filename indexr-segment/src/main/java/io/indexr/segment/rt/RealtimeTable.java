@@ -22,6 +22,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import io.indexr.segment.SegmentUploader;
+import io.indexr.segment.storage.Version;
 import io.indexr.util.DelayRepeatTask;
 import io.indexr.util.Trick;
 import io.indexr.util.Try;
@@ -202,11 +203,17 @@ public class RealtimeTable implements Closeable {
 
     private long ingest() {
         synchronized (ingestThreadLock) {
-            if (state == State.CLOSE
-                    || (!isIngestState() || !setting.ingest)) {
+            if (!isIngestState()) {
                 if (Thread.currentThread() == ingestThread) {
                     ingestThread = null;
                 }
+                return -1;
+            }
+            if (!setting.ingest) {
+                if (Thread.currentThread() == ingestThread) {
+                    ingestThread = null;
+                }
+                state = State.STOP;
                 return -1;
             }
             if (Thread.currentThread() != ingestThread) {
@@ -240,7 +247,7 @@ public class RealtimeTable implements Closeable {
                             setting.metrics,
                             setting.nameToAlias,
                             setting.grouping,
-                            setting.compress),
+                            setting.mode),
                     1, logger,
                     String.format("Create new rts group failed. [table: %s, rtsg: %s]", tableName, rtsgName));
             if (rtsGroup == null) {
@@ -315,7 +322,7 @@ public class RealtimeTable implements Closeable {
                     setting.metrics,
                     setting.nameToAlias,
                     setting.tagSetting,
-                    EventIgnoreStrategy.nameToId(setting.ignoreStrategy),
+                    setting.ignoreStrategy,
                     setting.grouping,
                     setting.fetcher,
                     setting.maxRowInMemory,
@@ -354,7 +361,7 @@ public class RealtimeTable implements Closeable {
             }
         }
         if (count >= WarnRTSGroupSize) {
-            logger.warn("Too many rts groups! [table: {}, rtsg count: {}]", tableName, count);
+            logger.warn("Too many rts groups! [table: {}, rtsg valueCount: {}]", tableName, count);
         }
     }
 
@@ -426,7 +433,9 @@ public class RealtimeTable implements Closeable {
     // Wether this rtsg holds the latest setting.
     private boolean isRTSGSettingOk(RTSGroup rtsGroup) {
         Path rtsgPath = rtsGroup.path();
-        return rtsgPath.getParent().equals(localDir)
+        return rtsGroup.version() == Version.LATEST_ID
+                && rtsGroup.mode().equals(setting.mode)
+                && rtsgPath.getParent().equals(localDir)
                 && rtsGroup.schema().equals(setting.schema)
                 && rtsGroup.grouping() == setting.grouping
                 && Trick.equals(rtsGroup.dims(), setting.dims)

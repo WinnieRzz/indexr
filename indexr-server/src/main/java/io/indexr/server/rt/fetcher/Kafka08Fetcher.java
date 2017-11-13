@@ -6,7 +6,6 @@ import com.google.common.base.Preconditions;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
-import org.apache.directory.api.util.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -26,6 +25,7 @@ import io.indexr.segment.rt.UTF8Row;
 import io.indexr.util.CombinedBlockingIterator;
 import io.indexr.util.IOUtil;
 import io.indexr.util.JsonUtil;
+import io.indexr.util.Strings;
 import io.indexr.util.UTF8Util;
 import kafka.consumer.Consumer;
 import kafka.consumer.ConsumerConfig;
@@ -40,6 +40,8 @@ public class Kafka08Fetcher implements Fetcher {
     public final String topic;
     @JsonProperty("topics")
     public final List<String> topics;
+    @JsonProperty("number.empty.as.zero")
+    public boolean numberEmptyAsZero;
     @JsonProperty("properties")
     public final Properties properties;
 
@@ -47,11 +49,12 @@ public class Kafka08Fetcher implements Fetcher {
     private Iterator<byte[]> eventItr;
     private volatile List<byte[]> remaining;
 
-    private final UTF8JsonRowCreator utf8JsonRowCreator = new UTF8JsonRowCreator();
+    private final UTF8JsonRowCreator utf8JsonRowCreator;
 
     @JsonCreator
     public Kafka08Fetcher(@JsonProperty("topic") String topic,
                           @JsonProperty("topics") List<String> topics,
+                          @JsonProperty("number.empty.as.zero") Boolean numberEmptyAsZero,
                           @JsonProperty("properties") Properties properties) {
         if (topics == null || topics.isEmpty()) {
             Preconditions.checkState(!Strings.isEmpty(topic), "topic or topics should be specified!");
@@ -59,7 +62,10 @@ public class Kafka08Fetcher implements Fetcher {
         }
         this.topic = topic;
         this.topics = topics;
+        this.numberEmptyAsZero = numberEmptyAsZero == null ? false : numberEmptyAsZero;
         this.properties = properties;
+
+        this.utf8JsonRowCreator = new UTF8JsonRowCreator(this.numberEmptyAsZero);
     }
 
     @Override

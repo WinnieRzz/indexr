@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 # local maven repo path
-export MAVEN_PATH=~/.m2/repository
-export VERSION=0.1.0
+export MAVEN_PATH=`mvn help:evaluate -Dexpression=settings.localRepository | grep -v '^\[.*$'`
+export VERSION=0.6.1
 
 # local c++ lib env
 export BOOST_INCLUDES=/usr/local/include
@@ -23,3 +23,10 @@ function print_exec {
     echo $1
     $1
 }
+
+if [ ! -d ${MAVEN_PATH} ]; then
+    echo "Maven local repository path not exits: $MAVEN_PATH";
+    exit 1
+fi
+
+echo "Maven local repository path: $MAVEN_PATH";

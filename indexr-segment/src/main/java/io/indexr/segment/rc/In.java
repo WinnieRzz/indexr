@@ -4,25 +4,24 @@ import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
-import org.apache.spark.unsafe.array.ByteArrayMethods;
 import org.apache.spark.unsafe.types.UTF8String;
 
 import java.io.IOException;
 import java.util.Arrays;
-import java.util.BitSet;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import io.indexr.data.BytePiece;
 import io.indexr.segment.Column;
 import io.indexr.segment.ColumnType;
 import io.indexr.segment.InfoSegment;
+import io.indexr.segment.OuterIndex;
+import io.indexr.segment.PackExtIndex;
 import io.indexr.segment.RSValue;
 import io.indexr.segment.Segment;
-import io.indexr.segment.pack.ColumnNode;
-import io.indexr.segment.pack.DataPack;
+import io.indexr.segment.storage.ColumnNode;
+import io.indexr.util.BitMap;
 
 public class In implements CmpOperator {
     @JsonProperty("attr")
@@ -51,17 +50,7 @@ public class In implements CmpOperator {
     public In(@JsonProperty("attr") Attr attr,
               @JsonProperty("numValues") long[] numValues,
               @JsonProperty("strValues") String[] strValues) {
-        this.attr = attr;
-        this.numValues = numValues;
-        if (strValues == null) {
-            this.strValues = null;
-        } else {
-            UTF8String[] vs = new UTF8String[strValues.length];
-            for (int i = 0; i < strValues.length; i++) {
-                vs[i] = strValues[i] == null ? null : UTF8String.fromString(strValues[i]);
-            }
-            this.strValues = vs;
-        }
+        this(attr, numValues, toUTF8Arr(strValues));
     }
 
     public In(Attr attr,
@@ -70,6 +59,17 @@ public class In implements CmpOperator {
         this.attr = attr;
         this.numValues = numValues;
         this.strValues = strValues;
+    }
+
+    static UTF8String[] toUTF8Arr(String[] strValues) {
+        if (strValues == null) {
+            return null;
+        }
+        UTF8String[] vs = new UTF8String[strValues.length];
+        for (int i = 0; i < strValues.length; i++) {
+            vs[i] = strValues[i] == null ? null : UTF8String.fromString(strValues[i]);
+        }
+        return vs;
     }
 
     @Override
@@ -111,6 +111,16 @@ public class In implements CmpOperator {
     }
 
     @Override
+    public BitMap exactCheckOnPack(Segment segment) throws IOException {
+        assert attr.checkCurrent(segment.schema().columns);
+
+        Column column = segment.column(attr.columnId());
+        try (OuterIndex outerIndex = column.outerIndex()) {
+            return outerIndex.in(column, numValues, strValues, false);
+        }
+    }
+
+    @Override
     public byte roughCheckOnPack(Segment segment, int packId) throws IOException {
         assert attr.checkCurrent(segment.schema().columns);
 
@@ -134,7 +144,7 @@ public class In implements CmpOperator {
 
         int colId = attr.columnId();
         ColumnNode columnNode = segment.columnNode(colId);
-        byte type = attr.columType();
+        byte type = attr.dataType();
         if (ColumnType.isNumber(type)) {
             if (!calced) {
                 calMinMax(type);
@@ -147,85 +157,10 @@ public class In implements CmpOperator {
     }
 
     @Override
-    public byte roughCheckOnRow(DataPack[] rowPacks) {
-        DataPack pack = rowPacks[attr.columnId()];
-        byte type = attr.columType();
-        int rowCount = pack.objCount();
-        int hitCount = 0;
-        switch (type) {
-            case ColumnType.STRING: {
-                BytePiece bp = new BytePiece();
-                for (int rowId = 0; rowId < rowCount; rowId++) {
-                    pack.rawValueAt(rowId, bp);
-                    for (UTF8String value : strValues) {
-                        if (bp.len == value.numBytes()
-                                && ByteArrayMethods.arrayEquals(value.getBaseObject(), value.getBaseOffset(), bp.base, bp.addr, bp.len)) {
-                            hitCount++;
-                        }
-                    }
-                }
-                break;
-            }
-            default: {
-                for (int rowId = 0; rowId < rowCount; rowId++) {
-                    long v = pack.uniformValAt(rowId, type);
-                    for (long value : numValues) {
-                        if (v == value) {
-                            hitCount++;
-                        }
-                    }
-                }
-                break;
-            }
-        }
-        if (hitCount == rowCount) {
-            return RSValue.All;
-        } else if (hitCount > 0) {
-            return RSValue.Some;
-        } else {
-            return RSValue.None;
-        }
-    }
-
-    @Override
-    public BitSet exactCheckOnRow(DataPack[] rowPacks) {
-        DataPack pack = rowPacks[attr.columnId()];
-        int rowCount = pack.objCount();
-        BitSet colRes = new BitSet(rowCount);
-        byte type = attr.columType();
-        switch (type) {
-            case ColumnType.STRING: {
-                BytePiece bp = new BytePiece();
-                for (int rowId = 0; rowId < rowCount; rowId++) {
-                    pack.rawValueAt(rowId, bp);
-                    boolean ok = false;
-                    for (UTF8String value : strValues) {
-                        if (bp.len == value.numBytes()
-                                && ByteArrayMethods.arrayEquals(value.getBaseObject(), value.getBaseOffset(), bp.base, bp.addr, bp.len)) {
-                            ok = true;
-                            break;
-                        }
-                    }
-                    colRes.set(rowId, ok);
-                }
-                break;
-            }
-            default: {
-                for (int rowId = 0; rowId < rowCount; rowId++) {
-                    long v = pack.uniformValAt(rowId, type);
-                    boolean ok = false;
-                    for (long value : numValues) {
-                        if (v == value) {
-                            ok = true;
-                            break;
-                        }
-                    }
-                    colRes.set(rowId, ok);
-                }
-                break;
-            }
-        }
-        return colRes;
+    public BitMap exactCheckOnRow(Segment segment, int packId) throws IOException {
+        Column column = segment.column(attr.columnId());
+        PackExtIndex extIndex = column.extIndex(packId);
+        return extIndex.in(column, packId, numValues, strValues);
     }
 
     @Override

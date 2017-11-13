@@ -3,12 +3,13 @@ package io.indexr.segment.rt;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
-import org.apache.directory.api.util.Strings;
 import org.apache.spark.unsafe.Platform;
 import org.apache.spark.unsafe.array.ByteArrayMethods;
 import org.apache.spark.unsafe.types.UTF8String;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import sun.misc.VM;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -22,9 +23,12 @@ import io.indexr.data.BytePiece;
 import io.indexr.segment.ColumnSchema;
 import io.indexr.segment.ColumnType;
 import io.indexr.segment.Row;
+import io.indexr.segment.SQLType;
 import io.indexr.util.ByteArrayWrapper;
+import io.indexr.util.BytesUtil;
 import io.indexr.util.MemoryUtil;
 import io.indexr.util.Serializable;
+import io.indexr.util.Strings;
 import io.indexr.util.Trick;
 import io.indexr.util.UTF8JsonDeserializer;
 import io.indexr.util.UTF8Util;
@@ -34,9 +38,9 @@ import static org.apache.spark.unsafe.Platform.LONG_ARRAY_OFFSET;
 
 /**
  * A row with strings stored in UTF-8 format.
- * <p/>
+ *
  * This class is <b>NOT</b> multi-thread safe.
- * <p/>
+ *
  * Data structure:
  * If grouping:
  * <pre>
@@ -44,19 +48,19 @@ import static org.apache.spark.unsafe.Platform.LONG_ARRAY_OFFSET;
  *         dim values               dim raw values        metric values
  *                                                       (metric values are all numbers)
  * </pre>
- * <p/>
+ *
  * no grouping:
  * <pre>
  *      |........................|.................|
  *           values                   raw values
  * </pre>
- * <p/>
+ *
  * The value, if number type, represents the uniform value;
  * if string type, higher 32 bits represents the offset of raw value, lower 32 bits represents the len.
- * <p/>
+ *
  * The rows is sorted by dims if exists. And if grouping is true, those rows with the same dims will be
  * merged into one.
- * <p/>
+ *
  * Node: An UTF8Row should call {@link #free()} to free it memory after done with, otherwise will lead to memory leak.
  */
 public class UTF8Row implements Row, Serializable {
@@ -87,9 +91,9 @@ public class UTF8Row implements Row, Serializable {
         private final int columnCount;
 
         // colId -> type
-        private final byte[] columnTypes;
+        private final SQLType[] columnTypes;
         // index -> type
-        private final byte[] indexTypes;
+        private final SQLType[] indexTypes;
         // metric agg types.
         private final int[] indexAggTypes;
 
@@ -128,7 +132,7 @@ public class UTF8Row implements Row, Serializable {
                        List<Metric> metrics,
                        Map<String, String> nameToAlias,
                        TagSetting tagSetting,
-                       int ignoreStrategy) {
+                       EventIgnoreStrategy ignoreStrategy) {
             Trick.notRepeated(columnSchemas, ColumnSchema::getName);
             Trick.notRepeated(dims, d -> d);
             Trick.notRepeated(metrics, m -> m.name);
@@ -136,14 +140,14 @@ public class UTF8Row implements Row, Serializable {
                 Trick.notRepeated(Trick.concatToList(dims, Lists.transform(metrics, m -> m.name)), s -> s);
             }
 
-            this.ignoreStrategy = ignoreStrategy;
+            this.ignoreStrategy = ignoreStrategy.id;
 
             this.originalSchema = columnSchemas;
             this.columnCount = columnSchemas.size();
 
             this.nameToIndex = new HashMap<>(columnCount);
-            this.columnTypes = new byte[columnCount];
-            this.indexTypes = new byte[columnCount];
+            this.columnTypes = new SQLType[columnCount];
+            this.indexTypes = new SQLType[columnCount];
             this.numDefaultValues = new long[columnCount];
             this.strDefaultValues = new byte[columnCount][];
             this.hasDims = dims != null && dims.size() != 0;
@@ -158,7 +162,7 @@ public class UTF8Row implements Row, Serializable {
 
             for (int i = 0; i < columnCount; i++) {
                 ColumnSchema cs = columnSchemas.get(i);
-                columnTypes[i] = cs.getDataType();
+                columnTypes[i] = cs.getSqlType();
             }
 
             if (nameToAlias != null && !nameToAlias.isEmpty()) {
@@ -263,12 +267,12 @@ public class UTF8Row implements Row, Serializable {
             int bufferSize = 0;
             for (int i = 0; i < columnCount; i++) {
                 ColumnSchema cs = finalSchema.get(i);
-                byte type = cs.getDataType();
+                SQLType type = cs.getSqlType();
                 indexTypes[i] = type;
                 numDefaultValues[i] = cs.getDefaultNumberValue();
                 strDefaultValues[i] = UTF8Util.toUtf8(cs.getDefaultStringValue());
 
-                bufferSize += ColumnType.bufferSize(type);
+                bufferSize += ColumnType.bufferSize(type.dataType);
                 byte[] utf8Name = UTF8Util.toUtf8(cs.getName());
                 nameToIndex.put(new ByteArrayWrapper(utf8Name), i);
             }
@@ -288,7 +292,7 @@ public class UTF8Row implements Row, Serializable {
                 return null;
             }
             switch (ignoreStrategy) {
-                case EventIgnoreStrategy.IGNORE_EMPTY:
+                case EventIgnoreStrategy.ID_IGNORE_EMPTY:
                     if (isEmpty()) {
                         return null;
                     }
@@ -303,7 +307,7 @@ public class UTF8Row implements Row, Serializable {
                     continue;
                 }
                 onColumnIndex(index);
-                switch (indexTypes[index]) {
+                switch (indexTypes[index].dataType) {
                     case ColumnType.STRING:
                         onStringValue(strDefaultValues[index]);
                         break;
@@ -318,7 +322,25 @@ public class UTF8Row implements Row, Serializable {
             // Use off-heap memory to store row data.
             // We don't want those rows stored in JVM headp as they can put too much pressure on GC.
             // Besides those rows' lifecycle can be easily managed.
-            long rowDataAddr = MemoryUtil.allocate(totalRowSize);
+
+            // Copied from java.nio.DirectByteBuffer
+
+            long rowDataMemoryBase;
+            long rowDataAddr;
+
+            boolean pa = VM.isDirectMemoryPageAligned();
+            int ps = MemoryUtil.pageSize();
+            long size = Math.max(1L, (long) totalRowSize + (pa ? ps : 0));
+            rowDataMemoryBase = MemoryUtil.allocate(size);
+            MemoryUtil.setMemory(rowDataMemoryBase, size, (byte) 0);
+
+            if (pa && (rowDataMemoryBase % ps != 0)) {
+                // Round up to page boundary
+                rowDataAddr = rowDataMemoryBase + ps - (rowDataMemoryBase & (ps - 1));
+            } else {
+                rowDataAddr = rowDataMemoryBase;
+            }
+
             if (hasDims) {
                 // Put dims values and raw values together, convient for equal check.
                 int dimValueSize = dimCount << 3;
@@ -326,7 +348,7 @@ public class UTF8Row implements Row, Serializable {
 
                 int curRawDataOffset = dimValueSize;
                 for (int dimId = 0; dimId < dimCount; dimId++) {
-                    byte type = indexTypes[dimId];
+                    byte type = indexTypes[dimId].dataType;
                     if (type == ColumnType.STRING) {
                         long offsetAndLen = MemoryUtil.getLong(rowDataAddr + (dimId << 3));
                         int offset = (int) (offsetAndLen >>> 32);
@@ -351,7 +373,7 @@ public class UTF8Row implements Row, Serializable {
 
                 curRawDataOffset += metricValueSize;
                 for (int metricId = 0; metricId < metricCount; metricId++) {
-                    byte type = indexTypes[dimCount + metricId];
+                    byte type = indexTypes[dimCount + metricId].dataType;
                     if (type == ColumnType.STRING) {
                         long offsetAndLen = MemoryUtil.getLong(rowDataAddr + dimDataSize + (metricId << 3));
                         int offset = (int) (offsetAndLen >>> 32);
@@ -369,15 +391,14 @@ public class UTF8Row implements Row, Serializable {
                 }
 
                 long code = grouping ? 0 : nextRowId++;
-                return new UTF8Row(code, this, rowDataAddr, totalRowSize, dimDataSize);
+                return new UTF8Row(code, this, rowDataMemoryBase, rowDataAddr, totalRowSize, dimDataSize);
             } else {
                 int valueSize = columnCount << 3;
                 Platform.copyMemory(valuesBuffer, LONG_ARRAY_OFFSET, null, rowDataAddr, valueSize);
-                Platform.copyMemory(rawValuesBuffer, BYTE_ARRAY_OFFSET, null, rowDataAddr + valueSize, curRowRawValueBytes);
 
                 int curRawDataOffset = valueSize;
                 for (int index = 0; index < columnCount; index++) {
-                    byte type = indexTypes[index];
+                    byte type = indexTypes[index].dataType;
                     if (type == ColumnType.STRING) {
                         long offsetAndLen = MemoryUtil.getLong(rowDataAddr + (index << 3));
                         int offset = (int) (offsetAndLen >>> 32);
@@ -385,6 +406,8 @@ public class UTF8Row implements Row, Serializable {
                         int newOffset = curRawDataOffset;
                         curRawDataOffset += len;
 
+                        // Copy raw data into row data.
+                        Platform.copyMemory(rawValuesBuffer, BYTE_ARRAY_OFFSET + offset, null, rowDataAddr + newOffset, len);
                         // The raw data is moved, we need to specify the new offset and len.
                         MemoryUtil.setLong(rowDataAddr + (index << 3), (((long) newOffset) << 32) | (long) len);
                     } else {
@@ -392,7 +415,7 @@ public class UTF8Row implements Row, Serializable {
                     }
                 }
 
-                return new UTF8Row(nextRowId++, this, rowDataAddr, totalRowSize, 0);
+                return new UTF8Row(nextRowId++, this, rowDataMemoryBase, rowDataAddr, totalRowSize, 0);
             }
         }
 
@@ -454,7 +477,7 @@ public class UTF8Row implements Row, Serializable {
             return buildRow();
         }
 
-        public byte onColumnUTF8Name(ByteBuffer key, int size) {
+        public int onColumnUTF8Name(ByteBuffer key, int size) {
             assert key.hasArray() && key.arrayOffset() == 0;
 
             if (curRowIgnore) {
@@ -471,7 +494,7 @@ public class UTF8Row implements Row, Serializable {
                 // The tag field always be string.
                 curRowIsTagField = true;
                 curRowHasTagField = true;
-                return UTF8JsonDeserializer.STRING;
+                return UTF8JsonDeserializer.VARCHAR;
             }
 
             cmpWrapper.set(arr, offset, size);
@@ -488,7 +511,7 @@ public class UTF8Row implements Row, Serializable {
             if (index == null) {
                 return -1;
             } else {
-                return indexTypes[index];
+                return indexTypes[index].id;
             }
         }
 
@@ -526,10 +549,14 @@ public class UTF8Row implements Row, Serializable {
         }
 
         public boolean onStringValue(long addr, int size) {
+            return onStringValue(null, addr, size);
+        }
+
+        public boolean onStringValue(Object base, long offset, int size) {
             if (curRowIsTagField) {
                 boolean ok = false;
                 for (byte[] tag : acceptTags) {
-                    if (UTF8Util.containsCommaSep(null, addr, size, tag)) {
+                    if (UTF8Util.containsCommaSep(base, offset, size, tag)) {
                         ok = true;
                         break;
                     }
@@ -544,7 +571,7 @@ public class UTF8Row implements Row, Serializable {
             putValue(curRowIndex, (((long) rawValueOffset) << 32) | (long) size);
 
             Platform.copyMemory(
-                    null, addr,
+                    base, offset,
                     rawValuesBuffer, BYTE_ARRAY_OFFSET + rawValueOffset,
                     size);
 
@@ -615,9 +642,9 @@ public class UTF8Row implements Row, Serializable {
             startRow();
             while (byteBuffer.position() < pos + size) {
                 int colId = byteBuffer.getShort();
-                byte type = columnTypes[colId];
+                SQLType type = columnTypes[colId];
                 onColumnIndex(colIdToIndex[colId]);
-                switch (type) {
+                switch (type.dataType) {
                     case ColumnType.INT:
                         onIntValue(byteBuffer.getInt());
                         break;
@@ -643,6 +670,9 @@ public class UTF8Row implements Row, Serializable {
     }
 
     private final Creator creator;
+    // The memory where row data allocated. This value is used to free memory.
+    private long rowDataMemoryBase;
+    // The memory where row data actually begin.
     private long rowDataAddr;
     private final int rowDataSize;
     private final int dimDataSize;
@@ -651,17 +681,19 @@ public class UTF8Row implements Row, Serializable {
     // This is used to stop comparator return 0 if grouping is disable.
     private final long code;
 
-    private UTF8Row(long code, Creator creator, long rowDataAddr, int rowDataSize, int dimDataSize) {
+    private UTF8Row(long code, Creator creator, long rowDataMemoryBase, long rowDataAddr, int rowDataSize, int dimDataSize) {
         this.code = code;
         this.creator = creator;
+        this.rowDataMemoryBase = rowDataMemoryBase;
         this.rowDataAddr = rowDataAddr;
         this.rowDataSize = rowDataSize;
         this.dimDataSize = dimDataSize;
     }
 
     public void free() {
-        if (rowDataAddr != 0) {
-            MemoryUtil.free(rowDataAddr);
+        if (rowDataMemoryBase != 0) {
+            MemoryUtil.free(rowDataMemoryBase);
+            rowDataMemoryBase = 0;
             rowDataAddr = 0;
         }
     }
@@ -683,54 +715,46 @@ public class UTF8Row implements Row, Serializable {
         throw new IllegalStateException("Should not call this method!");
     }
 
-    /**
+    /*
      * This compare method does not actually sort the rows by the real values, but by raw bytes.
      * It only guarrantee the consistent of comparation. i.e. a >= b, b >= c -> a >= c.
      */
     public static Comparator<UTF8Row> dimBytesComparator() {
         return (r1, r2) -> {
-            if (r1 == null || r2 == null) {
-                System.out.println();
+            if ((r1 == null || r2 == null)
+                    || (r1.rowDataAddr == 0 || r2.rowDataAddr == 0)) {
+                throw new IllegalStateException("illegal row compare");
             }
-            if (r1.rowDataAddr == 0 || r2.rowDataAddr == 0) {
-                throw new IllegalStateException("illegal row");
-            }
+            assert r1.creator.dimCount == r2.creator.dimCount;
+
             int len = Math.min(r1.dimDataSize, r2.dimDataSize);
             if (len == 0) {
                 return Long.compare(r1.code, r2.code);
             }
 
+            int dimCount = r1.creator.dimCount;
             long rowDataAddr1 = r1.rowDataAddr;
             long rowDataAddr2 = r2.rowDataAddr;
-            int wordLen = len & 0xFFFF_FFF8;
+
             int res;
-
             long word1, word2;
-            for (int i = 0; i < wordLen; i += 8) {
-                word1 = MemoryUtil.getLong(rowDataAddr1 + i);
-                word2 = MemoryUtil.getLong(rowDataAddr2 + i);
-                res = Long.compare(word1, word2);
+            for (int i = 0; i < dimCount; i++) {
+                word1 = MemoryUtil.getLong(rowDataAddr1 + (i << 3));
+                word2 = MemoryUtil.getLong(rowDataAddr2 + (i << 3));
+                if (r1.creator.indexTypes[i].dataType == ColumnType.STRING) {
+                    int offset1 = (int) (word1 >>> 32);
+                    int len1 = (int) word1 & ColumnType.MAX_STRING_UTF8_SIZE_MASK;
+
+                    int offset2 = (int) (word2 >>> 32);
+                    int len2 = (int) word2 & ColumnType.MAX_STRING_UTF8_SIZE_MASK;
+
+                    res = BytesUtil.compareBytes(rowDataAddr1 + offset1, len1, rowDataAddr2 + offset2, len2);
+                } else {
+                    res = Long.compare(word1, word2);
+                }
                 if (res != 0) {
                     return res;
                 }
-            }
-
-            if ((len & 0x07) != 0) {
-                long tail1 = 0;
-                long tail2 = 0;
-                for (int i = wordLen; i < len; i++) {
-                    tail1 = (tail1 << 8) | (MemoryUtil.getByte(rowDataAddr1 + i) & 0xFF);
-                    tail2 = (tail2 << 8) | (MemoryUtil.getByte(rowDataAddr2 + i) & 0xFF);
-                }
-                res = Long.compare(tail1, tail2);
-                if (res != 0) {
-                    return res;
-                }
-            }
-
-            res = r1.dimDataSize - r2.dimDataSize;
-            if (res != 0) {
-                return res;
             }
 
             // If we don't do grouping we should never let it return zero.
@@ -746,9 +770,9 @@ public class UTF8Row implements Row, Serializable {
         for (ColumnSchema cs : creator.originalSchema) {
             sb.append('\"').append(cs.getName()).append("\": ");
             if (cs.getDataType() == ColumnType.STRING) {
-                sb.append('\"').append(getDisplayString(colId, cs.getDataType())).append('\"');
+                sb.append('\"').append(getInternalString(colId, cs.getDataType())).append('\"');
             } else {
-                sb.append(getDisplayString(colId, cs.getDataType()));
+                sb.append(getInternalString(colId, cs.getDataType()));
             }
             colId++;
             if (colId < creator.columnCount) {
@@ -761,7 +785,7 @@ public class UTF8Row implements Row, Serializable {
 
     @Override
     public boolean serialize(ByteBuffer byteBuffer) {
-        if (byteBuffer.capacity() < rowDataSize + 4 + (creator.columnCount << 1)) {
+        if (byteBuffer.remaining() < rowDataSize + 4 + (creator.columnCount << 2)) {
             // Fast way to detect whether the remaining cap can hold the serialize data or not.
             // We don't need to be exactualy acurrate.
             return false;
@@ -776,7 +800,7 @@ public class UTF8Row implements Row, Serializable {
             byteBuffer.putShort((short) colId);
             size += 2;
             // Store in real type instead of long to reduce size.
-            byte type = creator.columnTypes[colId];
+            byte type = creator.columnTypes[colId].dataType;
             switch (type) {
                 case ColumnType.INT:
                     byteBuffer.putInt(getInt(colId));
@@ -831,26 +855,7 @@ public class UTF8Row implements Row, Serializable {
     }
 
     private long strOffsetLen(int colId) {
-        assert creator.colIdToIndex != null;
-        if (rowDataAddr == 0) {
-            throw new IllegalStateException("illegal row");
-        }
-
-        int offset = 0;
-        if (creator.hasDims) {
-            int realIndex = creator.colIdToIndex[colId];
-            if (realIndex < creator.dimCount) {
-                // A dim.
-                offset = realIndex << 3;
-            } else {
-                // A metric.
-                int metricIndex = realIndex - creator.dimCount;
-                offset = dimDataSize + (metricIndex << 3);
-            }
-        } else {
-            offset = colId << 3;
-        }
-        return MemoryUtil.getLong(rowDataAddr + offset);
+        return numValue(colId);
     }
 
     public void merge(UTF8Row other) {
@@ -862,7 +867,7 @@ public class UTF8Row implements Row, Serializable {
         }
 
         for (int index = creator.dimCount; index < creator.columnCount; index++) {
-            byte type = creator.indexTypes[index];
+            byte type = creator.indexTypes[index].dataType;
             int aggType = creator.indexAggTypes[index];
             int metricIndex = index - creator.dimCount;
             long offset = dimDataSize + (metricIndex << 3);
@@ -942,5 +947,41 @@ public class UTF8Row implements Row, Serializable {
         byte[] bytes = new byte[len];
         Platform.copyMemory(null, rowDataAddr + offset, bytes, BYTE_ARRAY_OFFSET, len);
         return bytes;
+    }
+
+    // ===================================
+    // Static methods
+    // ===================================
+
+    public static UTF8Row from(Creator creator, Row row) {
+        List<ColumnSchema> csList = creator.originalSchema;
+        BytePiece bp = new BytePiece();
+        creator.startRow();
+        for (int id = 0; id < csList.size(); id++) {
+            creator.onColumnId(id);
+
+            ColumnSchema cs = csList.get(id);
+            switch (cs.getDataType()) {
+                case ColumnType.INT:
+                    creator.onIntValue(row.getInt(id));
+                    break;
+                case ColumnType.LONG:
+                    creator.onLongValue(row.getLong(id));
+                    break;
+                case ColumnType.FLOAT:
+                    creator.onFloatValue(row.getFloat(id));
+                    break;
+                case ColumnType.DOUBLE:
+                    creator.onDoubleValue(row.getDouble(id));
+                    break;
+                case ColumnType.STRING:
+                    row.getRaw(id, bp);
+                    creator.onStringValue(bp.base, bp.addr, bp.len);
+                    break;
+                default:
+                    throw new IllegalStateException("Illegal type: " + cs.getDataType());
+            }
+        }
+        return creator.endRow();
     }
 }

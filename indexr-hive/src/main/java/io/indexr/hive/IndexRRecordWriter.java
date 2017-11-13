@@ -1,13 +1,14 @@
 package io.indexr.hive;
 
 import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.IOUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.ql.exec.FileSinkOperator;
-import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
-import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
+import org.apache.hadoop.hive.serde2.io.DateWritable;
+import org.apache.hadoop.hive.serde2.io.TimestampWritable;
 import org.apache.hadoop.io.ArrayWritable;
 import org.apache.hadoop.io.DoubleWritable;
 import org.apache.hadoop.io.FloatWritable;
@@ -21,21 +22,26 @@ import org.apache.hadoop.mapred.Reporter;
 
 import java.io.IOException;
 import java.nio.file.Files;
-import java.util.ArrayList;
-import java.util.List;
 
 import io.indexr.segment.ColumnSchema;
-import io.indexr.segment.ColumnType;
+import io.indexr.segment.Row;
+import io.indexr.segment.SQLType;
+import io.indexr.segment.SegmentMode;
 import io.indexr.segment.SegmentSchema;
 import io.indexr.segment.helper.SimpleRow;
-import io.indexr.segment.pack.DPSegment;
-import io.indexr.segment.pack.OpenOption;
+import io.indexr.segment.pack.DataPack;
+import io.indexr.segment.rt.AggSchema;
+import io.indexr.segment.storage.DPSegment;
+import io.indexr.segment.storage.OpenOption;
+import io.indexr.segment.storage.SortedSegmentGenerator;
+import io.indexr.segment.storage.Version;
+import io.indexr.util.DateTimeUtil;
 
 public class IndexRRecordWriter implements FileSinkOperator.RecordWriter, RecordWriter<Void, ArrayWritable> {
     private static final Log logger = LogFactory.getLog(IndexRRecordWriter.class);
 
-    private DPSegment segment;
-    private byte[] columnTypes;
+    private SegmentGen segmentGen;
+    private SQLType[] sqlTypes;
     private SimpleRow.Builder rowBuilder;
     private FileSystem fileSystem;
     private java.nio.file.Path localSegmentPath;
@@ -45,11 +51,11 @@ public class IndexRRecordWriter implements FileSinkOperator.RecordWriter, Record
     private Path segmentOutPath;
 
     public IndexRRecordWriter(JobConf jobConf,
-                              List<String> columnNames,
-                              List<TypeInfo> columnTypes,
+                              SegmentSchema schema,
                               Path finalOutPath,
                               Path tableLocation,
-                              boolean compress) throws IOException {
+                              SegmentMode mode,
+                              AggSchema aggSchema) throws IOException {
         // Hive may ask to create a file located on local file system.
         // We have to get the real file system by path's schema.
         this.fileSystem = FileSystem.get(finalOutPath.toUri(), FileSystem.get(jobConf).getConf());
@@ -58,103 +64,140 @@ public class IndexRRecordWriter implements FileSinkOperator.RecordWriter, Record
         this.tableLocation = tableLocation;
         this.segmentOutPath = finalOutPath;
 
-        SegmentSchema schema = convertToIndexRSchema(columnNames, columnTypes);
-        this.columnTypes = new byte[schema.columns.size()];
+        this.sqlTypes = new SQLType[schema.columns.size()];
         int i = 0;
         for (ColumnSchema sc : schema.columns) {
-            this.columnTypes[i] = sc.dataType;
+            this.sqlTypes[i] = sc.getSqlType();
             i++;
         }
         this.rowBuilder = SimpleRow.Builder.createByColumnSchemas(schema.columns);
 
-        segment = DPSegment.open(localSegmentPath.toString(), segmentName, schema, OpenOption.Overwrite);
-        segment.setCompress(compress).update();
-    }
+        if (aggSchema.dims.isEmpty()) {
+            DPSegment segment = DPSegment.open(
+                    Version.LATEST_ID,
+                    mode,
+                    localSegmentPath,
+                    segmentName,
+                    schema,
+                    OpenOption.Overwrite).update();
+            this.segmentGen = new SegmentGen() {
+                @Override
+                public void add(Row row) throws IOException {
+                    segment.add(row);
+                }
 
-    private SegmentSchema convertToIndexRSchema(List<String> columnNames, List<TypeInfo> columnTypes) throws IOException {
-        List<ColumnSchema> schemas = new ArrayList<ColumnSchema>();
-        for (int i = 0; i < columnNames.size(); i++) {
-            String currentColumn = columnNames.get(i);
-            TypeInfo currentType = columnTypes.get(i);
-            Byte convertedType = null;
+                @Override
+                public DPSegment gen() throws IOException {
+                    segment.seal();
+                    return segment;
+                }
+            };
+        } else {
+            SortedSegmentGenerator generator = new SortedSegmentGenerator(
+                    Version.LATEST_ID,
+                    mode,
+                    localSegmentPath,
+                    segmentName,
+                    schema,
+                    aggSchema.grouping,
+                    aggSchema.dims,
+                    aggSchema.metrics,
+                    DataPack.MAX_COUNT * 10);
+            this.segmentGen = new SegmentGen() {
+                @Override
+                public void add(Row row) throws IOException {
+                    generator.add(row);
+                }
 
-            if (currentType.equals(TypeInfoFactory.intTypeInfo)) {
-                convertedType = ColumnType.INT;
-            } else if (currentType.equals(TypeInfoFactory.longTypeInfo)) {
-                convertedType = ColumnType.LONG;
-            } else if (currentType.equals(TypeInfoFactory.floatTypeInfo)) {
-                convertedType = ColumnType.FLOAT;
-            } else if (currentType.equals(TypeInfoFactory.doubleTypeInfo)) {
-                convertedType = ColumnType.DOUBLE;
-            } else if (currentType.equals(TypeInfoFactory.stringTypeInfo)) {
-                convertedType = ColumnType.STRING;
-            } else {
-                throw new IOException("can't recognize this type [" + currentType.getTypeName() + "]");
-            }
-
-            schemas.add(new ColumnSchema(currentColumn, convertedType));
+                @Override
+                public DPSegment gen() throws IOException {
+                    return generator.seal();
+                }
+            };
         }
-        return new SegmentSchema(schemas);
     }
 
     @Override
     public void write(Writable w) throws IOException {
         ArrayWritable datas = (ArrayWritable) w;
-        for (int colId = 0; colId < columnTypes.length; colId++) {
-            byte type = columnTypes[colId];
+        for (int colId = 0; colId < sqlTypes.length; colId++) {
+            SQLType type = sqlTypes[colId];
             Writable currentValue = datas.get()[colId];
             switch (type) {
-                case ColumnType.INT:
+                case INT:
                     if (currentValue == null) {
                         rowBuilder.appendInt(0);
                     } else {
                         rowBuilder.appendInt(((IntWritable) currentValue).get());
                     }
                     break;
-                case ColumnType.LONG:
+                case BIGINT:
                     if (currentValue == null) {
                         rowBuilder.appendLong(0L);
                     } else {
                         rowBuilder.appendLong(((LongWritable) currentValue).get());
                     }
                     break;
-                case ColumnType.FLOAT:
+                case FLOAT:
                     if (currentValue == null) {
                         rowBuilder.appendFloat(0f);
                     } else {
                         rowBuilder.appendFloat(((FloatWritable) currentValue).get());
                     }
                     break;
-                case ColumnType.DOUBLE:
+                case DOUBLE:
                     if (currentValue == null) {
                         rowBuilder.appendDouble(0d);
                     } else {
                         rowBuilder.appendDouble(((DoubleWritable) currentValue).get());
                     }
                     break;
-                case ColumnType.STRING:
+                case VARCHAR:
                     if (currentValue == null) {
                         rowBuilder.appendString("");
                     } else {
-                        rowBuilder.appendString(((Text) currentValue).toString());
+                        Text v = (Text) currentValue;
+                        rowBuilder.appendUTF8String(v.getBytes(), 0, v.getLength());
+                    }
+                    break;
+                case DATE:
+                    if (currentValue == null) {
+                        rowBuilder.appendLong(0);
+                    } else {
+                        rowBuilder.appendLong(DateTimeUtil.getEpochMillisecond(((DateWritable) currentValue).get()));
+                    }
+                    break;
+                case DATETIME:
+                    if (currentValue == null) {
+                        rowBuilder.appendLong(0);
+                    } else {
+                        rowBuilder.appendLong(DateTimeUtil.getEpochMillisecond(((TimestampWritable) currentValue).getTimestamp()));
                     }
                     break;
                 default:
                     throw new IOException("can't recognize this type [" + type + "]");
             }
         }
-        segment.add(rowBuilder.buildAndReset());
+        segmentGen.add(rowBuilder.buildAndReset());
     }
 
     @Override
     public void close(boolean abort) throws IOException {
+        DPSegment segment = null;
         try {
-            segment.seal();
+            segment = segmentGen.gen();
             rowBuilder = null;
             if (!abort) {
-                SegmentHelper.uploadSegment(segment, fileSystem, segmentOutPath, tableLocation);
+                if (segment.rowCount() == 0) {
+                    // Only create an empty file.
+                    // We cannot just ignore this as hive will complain.
+                    IOUtils.closeQuietly(fileSystem.create(segmentOutPath));
+                } else {
+                    SegmentHelper.uploadSegment(segment, fileSystem, segmentOutPath, tableLocation);
+                }
             }
         } finally {
+            IOUtils.closeQuietly(segment);
             // Remove temporary dir.
             FileUtils.deleteDirectory(localSegmentPath.toFile());
         }
@@ -168,4 +211,9 @@ public class IndexRRecordWriter implements FileSinkOperator.RecordWriter, Record
         close(true);
     }
 
+    private static interface SegmentGen {
+        void add(Row row) throws IOException;
+
+        DPSegment gen() throws IOException;
+    }
 }

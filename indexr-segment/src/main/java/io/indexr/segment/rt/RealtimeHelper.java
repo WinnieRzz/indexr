@@ -2,8 +2,6 @@ package io.indexr.segment.rt;
 
 import com.google.common.collect.Lists;
 
-import org.apache.directory.api.util.Strings;
-
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -11,9 +9,11 @@ import java.util.Map;
 
 import io.indexr.segment.ColumnSchema;
 import io.indexr.segment.ColumnType;
+import io.indexr.util.Strings;
 import io.indexr.util.Trick;
 
 public class RealtimeHelper {
+
     public static String validateSetting(List<ColumnSchema> columnSchemas,
                                          List<String> dims,
                                          List<Metric> metrics,

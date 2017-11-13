@@ -4,9 +4,13 @@ import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
-import org.apache.directory.api.util.Strings;
+import java.io.Serializable;
 
-public class Metric {
+import io.indexr.util.Strings;
+
+public class Metric implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     @JsonProperty("name")
     public final String name;
     @JsonIgnore

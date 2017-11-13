@@ -5,7 +5,7 @@
     <parent>
         <artifactId>indexr</artifactId>
         <groupId>io.indexr</groupId>
-        <version>0.1.0</version>
+        <version>0.6.1</version>
     </parent>
     <modelVersion>4.0.0</modelVersion>
 
@@ -15,16 +15,37 @@
     </properties>
 
     <artifactId>indexr-query-opt</artifactId>
+    <name>${project.groupId}:${project.artifactId}</name>
+    <description>The query part of IndexR System</description>
+    <url>https://github.com/shunfei/indexr</url>
+
+    <licenses>
+        <license>
+            <name>The Apache License, Version 2.0</name>
+            <url>http://www.apache.org/licenses/LICENSE-2.0.txt</url>
+        </license>
+    </licenses>
+
+    <developers>
+        <developer>
+            <name>Flow Wei</name>
+            <email>flowbehappy@gmail.com</email>
+            <organization>Sunteng Tech</organization>
+            <organizationUrl>http://www.sunteng.com</organizationUrl>
+        </developer>
+    </developers>
+
+    <scm>
+        <connection>scm:git:git://github.com/shunfei/indexr.git</connection>
+        <developerConnection>scm:git:ssh://github.com:shunfei/indexr.git</developerConnection>
+        <url>http://github.com/shunfei/indexr/tree/master</url>
+    </scm>
+
     <dependencies>
         <dependency>
             <groupId>io.indexr</groupId>
             <artifactId>indexr-common</artifactId>
             <version>${project.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>com.carrotsearch</groupId>
-            <artifactId>hppc</artifactId>
-            <version>0.7.1</version>
         </dependency>
         <dependency>
             <groupId>org.antlr</groupId>
@@ -42,6 +63,9 @@
                 <executions>
                     <execution>
                         <id>antlr</id>
+                        <configuration>
+                            <outputDirectory>target/generated-sources</outputDirectory>
+                        </configuration>
                         <goals>
                             <goal>antlr4</goal>
                         </goals>
