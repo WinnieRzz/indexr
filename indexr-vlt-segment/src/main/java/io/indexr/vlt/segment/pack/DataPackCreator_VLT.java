@@ -176,7 +176,7 @@ public class DataPackCreator_VLT {
             Preconditions.checkState(
               byteCount <= ColumnType.MAX_STRING_UTF8_SIZE,
               "string in utf-8 should be smaller than 65535 and the value is [%s] bytes",
-              s+"| size: "+byteCount);
+              s+"| totalN:"+size+"|num:"+i+"|size: "+byteCount);
 //            Preconditions.checkState(
 //                    byteCount <= ColumnType.MAX_STRING_UTF8_SIZE,
 //                    "string in utf-8 should be smaller than %s bytes",
