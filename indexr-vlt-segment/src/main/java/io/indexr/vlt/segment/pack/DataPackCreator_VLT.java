@@ -174,9 +174,13 @@ public class DataPackCreator_VLT {
             UTF8String s = strings.get(i);
             int byteCount = s.numBytes();
             Preconditions.checkState(
-                    byteCount <= ColumnType.MAX_STRING_UTF8_SIZE,
-                    "string in utf-8 should be smaller than %s bytes",
-                    ColumnType.MAX_STRING_UTF8_SIZE);
+              byteCount <= ColumnType.MAX_STRING_UTF8_SIZE,
+              "string in utf-8 should be smaller than 65535 and the value is [%s] bytes",
+              s+"| size: "+byteCount);
+//            Preconditions.checkState(
+//                    byteCount <= ColumnType.MAX_STRING_UTF8_SIZE,
+//                    "string in utf-8 should be smaller than %s bytes",
+//                    ColumnType.MAX_STRING_UTF8_SIZE);
             strTotalLen += byteCount;
 
             index.putValue(s);
